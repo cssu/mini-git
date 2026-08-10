@@ -1,63 +1,56 @@
 # Branch Protection
 
-**Status: not yet enabled.** `main` is currently unprotected. GitHub does not
-allow branch protection rules or rulesets on private repositories under the free
-plan, and the `cssu` organization is on the free plan. See
-[Unblocking this](#unblocking-this) below.
+`main` is protected. You cannot push to it directly, and you cannot merge
+without a passing CI run and an approving review. This document records what is
+configured and how to change it.
 
-Until it is enabled, the pull request workflow in the README is a team
-convention rather than something GitHub enforces. Follow it anyway.
-
-## Intended Rules for `main`
-
-Apply these once the repository can support them, at
-`Settings -> Branches -> Branch protection rules -> Add rule`, with the branch
-name pattern `main`:
+## Rules on `main`
 
 - Require a pull request before merging.
 - Require 1 approving review.
 - Dismiss stale approvals when new commits are pushed.
 - Require conversation resolution before merging.
-- Require status checks to pass, and select `quality`.
+- Require the `quality` status check to pass.
 - Require branches to be up to date before merging.
 - Require linear history.
-- Include administrators.
+- Include administrators, so nobody can bypass the above.
 - Block force pushes.
 - Block branch deletion.
 
 The required status check is the `quality` job in
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), which runs
-`scripts/quality-check.sh`. That job has already run, so `quality` will appear
-in the status check selector. If the job is ever renamed, the rule has to be
-updated to require the new name, or nothing will be enforced.
+`scripts/quality-check.sh`. If that job is ever renamed, the protection rule has
+to be updated to require the new name, or nothing will be enforced.
 
-## Unblocking This
-
-Two options, either one is enough:
-
-1. **Make the repository public.** Branch protection is free on public
-   repositories. This is a team and CSSU decision, not a technical one.
-2. **Upgrade the organization to GitHub Team.** Paid per seat, and enables
-   protection on private repositories.
-
-GitHub Free does include protection for public repos only, so option 1 costs
-nothing but publishes the code.
-
-## Recommended Repository Settings
+## Merge Settings
 
 At `Settings -> General -> Pull Requests`:
 
-- Enable squash merging.
-- Disable merge commits.
-- Disable rebase merging.
-- Enable automatically delete head branches.
+- Squash merging enabled.
+- Merge commits disabled.
+- Rebase merging disabled.
+- Automatically delete head branches enabled.
 
 Squash-only keeps history on `main` to one commit per pull request, which is
-what "require linear history" expects. These settings work on the free plan and
-are independent of branch protection.
+what "require linear history" expects.
 
-## Notes
+## Why the Repository Is Public
 
+GitHub Free does not allow branch protection or rulesets on private
+repositories, and CSSU is on the free plan. Making the repository public was the
+no-cost way to get these protections. The alternative is upgrading the
+organization to GitHub Team.
+
+Because the repository is public, nothing secret belongs in it. No tokens, no
+credentials, no personal data, not even in a commit that gets reverted later.
+Git history is public too.
+
+## Changing These
+
+`Settings -> Branches -> Branch protection rules`, then edit the `main` rule.
 These are repository settings, not files, so they are not version controlled and
 a change takes effect immediately for everyone. Talk to the team before
 loosening anything.
+
+If you add a new required status check, the workflow has to have run at least
+once before GitHub will offer its name in the selector.

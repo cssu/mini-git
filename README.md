@@ -69,10 +69,11 @@ decision.
 - CI has to pass and one teammate has to approve before it merges.
 - Squash merge, then delete the branch.
 
-`main` is not protected yet, so for now this is a convention rather than
-something GitHub enforces. See
-[docs/branch-protection.md](docs/branch-protection.md) for why and how to turn
-it on.
+`main` is protected, so this is enforced rather than suggested.
+
+This repository is public, so never commit anything secret: no tokens, no
+credentials, no personal data. Git history is public too, so removing a secret
+in a later commit does not unpublish it.
 
 ## Checks
 
@@ -93,5 +94,5 @@ changes instead of whitespace. Tests are the ones you write in `tests/`.
 
 ## Docs
 
-- [docs/branch-protection.md](docs/branch-protection.md) - the intended rules on
-  `main`, and what is blocking them.
+- [docs/branch-protection.md](docs/branch-protection.md) - the rules on `main`
+  and the merge settings, and how to change them.

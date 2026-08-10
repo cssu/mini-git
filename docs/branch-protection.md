@@ -1,75 +1,45 @@
 # Branch Protection
 
-GitHub template repositories copy files, but they do not copy repository settings. Every repository created from this template must configure branch protection manually.
+`main` is protected. You cannot push to it directly, and you cannot merge
+without a passing CI run and an approving review. This document records what is
+configured and how to change it.
 
-Use this checklist after creating a new repository from the template.
-
-## Configure `main`
-
-Go to:
-
-`Settings -> Branches -> Branch protection rules -> Add branch protection rule`
-
-Set the branch name pattern to:
-
-```text
-main
-```
-
-Enable these settings:
+## Rules on `main`
 
 - Require a pull request before merging.
-- Require at least 1 approving review.
-- Dismiss stale pull request approvals when new commits are pushed.
+- Require 1 approving review.
+- Dismiss stale approvals when new commits are pushed.
 - Require conversation resolution before merging.
-- Require status checks to pass before merging.
+- Require the `quality` status check to pass.
 - Require branches to be up to date before merging.
 - Require linear history.
 - Include administrators.
 - Block force pushes.
 - Block branch deletion.
 
-## Required Status Check
+The required status check is the `quality` job in
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml), which runs
+`scripts/quality-check.sh`. If that job is ever renamed, the protection rule
+has to be updated to require the new name, or nothing will be enforced.
 
-Before the status check appears in the branch protection selector, the GitHub Actions workflow must run at least once.
+## Repository Settings
 
-The included `CI` workflow is an example. If a project changes the workflow or job names, require that project's equivalent lint/test status check instead.
+`Settings -> General -> Pull Requests`:
 
-To make it appear:
+- Squash merging enabled.
+- Merge commits disabled.
+- Rebase merging disabled.
+- Automatically delete head branches enabled.
 
-1. Push the repository to GitHub.
-2. Open a pull request, or push a commit to `main`.
-3. Wait for the `CI` workflow to run.
-4. Return to the branch protection rule.
-5. Select the required status check.
+Squash-only keeps history on `main` to one commit per pull request, which is
+what "require linear history" expects.
 
-The check may appear as either:
+## Changing These
 
-```text
-quality
-```
+`Settings -> Branches -> Branch protection rules`, then edit the `main` rule.
+These are repository settings, not files, so they are not version controlled and
+a change takes effect immediately for everyone. Talk to the team before
+loosening anything.
 
-or:
-
-```text
-CI / quality
-```
-
-Choose whichever one GitHub shows for this repository.
-
-## Recommended Repository Settings
-
-Go to:
-
-`Settings -> General -> Pull Requests`
-
-Recommended settings:
-
-- Enable squash merging.
-- Disable merge commits.
-- Disable rebase merging unless the project specifically wants it.
-- Enable automatically delete head branches.
-
-## Notes
-
-These settings cannot be enforced by files in this template alone. The files in `.github/` provide pull request templates and CI checks, but GitHub branch protection must be configured in each created repository.
+If you add a new required status check, the workflow has to have run at least
+once before GitHub will offer its name in the selector.

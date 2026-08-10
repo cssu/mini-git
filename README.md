@@ -1,70 +1,94 @@
-# 2026 Tech Project Template
+# mini-git
 
-Template repository for student tech projects.
+A version control system built from scratch in Python: a content-addressable
+object store, a staging area, commit history as a DAG, branching, merging, and
+push/pull over a TCP socket.
 
-The CI workflow and local hook scripts are examples for a Node.js project. Update them to match the language, package manager, linter, and test runner used by the project created from this template.
+The core logic is written by hand. No `libgit2`, no shelling out to system Git,
+no existing VCS libraries for storage, diffing, or merging. Hashing,
+compression, sockets, argument parsing, and testing libraries are fine.
 
-This template includes pull requests, branch protection, CI checks, and optional Git hooks to give student developers practice with workflows used on real engineering teams. These checks also help keep the repository cleaner by catching formatting, linting, and test issues before code is merged.
-
-## Repository Setup
-
-After creating a repository from this template:
-
-1. Configure branch protection for `main` using [docs/branch-protection.md](docs/branch-protection.md).
-
-2. Optional: install local Git hooks:
-
-   ```bash
-   scripts/install-git-hooks.sh
-   ```
-
-3. Replace or adjust the example quality checks as needed. The included Node.js checks run these commands when they are defined in `package.json`:
-
-   - `npm run lint`
-   - `npm run test`
-
-## Pull Request Flow
-
-- Work on a feature branch.
-- Open a pull request into `main`.
-- Complete the pull request checklist.
-- Wait for the required quality check to pass.
-- Get review approval before merging.
-
-## Local Quality Checks
-
-Run the same checks locally:
+## Getting Started
 
 ```bash
+git clone https://github.com/cssu/mini-git.git
+cd mini-git
+scripts/init.sh
+```
+
+That creates a virtual environment, installs everything, and installs the Git
+hooks. You need Python 3.11 or newer.
+
+Then:
+
+```bash
+minigit --help          # after `source .venv/bin/activate`
 scripts/quality-check.sh
 ```
 
-The pre-commit hook runs this script before each commit.
+## Dev Commands
 
-## Scripts
+Everything lives in `scripts/`. They all work from any directory in the repo
+and find the virtual environment themselves, so activating it is optional.
 
-These files are small command-line programs. They are written as `.sh` shell scripts so they can be run locally from the terminal and also reused by GitHub Actions.
+| Command | What it does |
+| --- | --- |
+| `scripts/init.sh` | One-time setup: virtual environment, dependencies, Git hooks. |
+| `scripts/install-dependencies.sh` | Reinstalls dependencies. Run it after someone changes `pyproject.toml`. |
+| `scripts/test.sh` | Runs the tests. Arguments pass through to pytest: `scripts/test.sh -k objects`. |
+| `scripts/quality-check.sh` | Lint, formatting, and tests. This is exactly what CI runs. |
+| `scripts/format.sh` | Fixes formatting and auto-fixable lint problems. |
+| `scripts/build.sh` | Builds an installable package into `dist/`. |
+| `scripts/install-git-hooks.sh` | Points Git at the hooks in `githooks/`. `init.sh` already does this. |
 
-- `scripts/install-dependencies.sh`
+## Layout
 
-  Installs the packages needed by a Node.js project. In most Node projects, dependencies are listed in `package.json` and installed with a package manager like `npm`, `pnpm`, or `yarn`. This script checks which lockfile the project has and uses the matching package manager.
+```
+minigit/
+  cli.py        the shared `minigit` command; each module registers subcommands here
+  errors.py     the exception types every module shares
+  objects.py    Module 1 - object storage
+  index.py      Module 2 - index and working tree
+  commits.py    Module 3 - commits and branching
+  remote.py     Module 4 - remotes and networking
+tests/
+scripts/        dev commands
+githooks/       the pre-commit hook
+docs/
+```
 
-  This is mainly used by CI before running tests, because a fresh GitHub Actions runner does not already have the project's dependencies installed.
+Each module file has a docstring saying what it owns, what it depends on, and
+what depends on it. Module boundaries follow the interface contract; changing a
+signature another module calls is a conversation with the team, not a solo
+decision.
 
-- `scripts/quality-check.sh`
+## How We Work
 
-  Runs the project's automated checks. In this template, it looks for `lint` and `test` scripts in `package.json`.
+- Branch off `main`. Never commit to `main` directly.
+- Open a pull request and fill in the checklist.
+- CI has to pass and one teammate has to approve before it merges.
+- Squash merge, then delete the branch.
 
-  A lint command checks code style and catches common mistakes. A test command runs the project's automated tests. If either command fails, the script fails too, which helps stop broken code from being merged.
+`main` is protected, so this is enforced rather than suggested.
 
-- `scripts/install-git-hooks.sh`
+## Checks
 
-  Tells Git to use the hook files in the `githooks/` folder. You usually run this once after cloning or creating the repository.
+Three things run your code, and they run the same checks:
 
-  Git hooks are scripts that Git can run automatically at certain moments, such as right before making a commit.
+- **The pre-commit hook** runs lint and formatting before each commit. It skips
+  tests to keep committing fast. If you need to bypass it for a
+  work-in-progress commit, `git commit --no-verify` works, but CI will still
+  catch what you skipped.
+- **`scripts/quality-check.sh`** runs lint, formatting, and tests. Run it before
+  opening a pull request.
+- **CI** runs `scripts/quality-check.sh` on every pull request and on every push
+  to `main`.
 
-- `githooks/pre-commit`
+A lint check catches unused imports, undefined names, and similar mistakes. A
+formatting check keeps everyone's code looking the same so diffs show real
+changes instead of whitespace. Tests are the ones you write in `tests/`.
 
-  Runs before Git creates a commit, but only after the hooks have been installed with `scripts/install-git-hooks.sh`.
+## Docs
 
-  This hook runs `scripts/quality-check.sh`, so developers get quick feedback before committing code that does not pass the project's checks.
+- [docs/branch-protection.md](docs/branch-protection.md) - the rules on `main`
+  and how they were configured.

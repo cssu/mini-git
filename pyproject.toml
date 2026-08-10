@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "minigit"
+version = "0.1.0"
+description = "A version control system built from scratch."
+readme = "README.md"
+requires-python = ">=3.11"
+
+# The core logic must be written from scratch, so there are no runtime
+# dependencies. Only the Python standard library is allowed here: hashlib,
+# zlib, socket, argparse, json, and friends.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6",
+  "build>=1.2",
+]
+
+[project.scripts]
+minigit = "minigit.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["minigit"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# E/F  pycodestyle + pyflakes (the usual "this is a mistake" checks)
+# I    import sorting
+# UP   prefer modern Python syntax
+# B    common bug patterns
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

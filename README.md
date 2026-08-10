@@ -69,7 +69,10 @@ decision.
 - CI has to pass and one teammate has to approve before it merges.
 - Squash merge, then delete the branch.
 
-`main` is protected, so this is enforced rather than suggested.
+`main` is not protected yet, so for now this is a convention rather than
+something GitHub enforces. See
+[docs/branch-protection.md](docs/branch-protection.md) for why and how to turn
+it on.
 
 ## Checks
 
@@ -90,5 +93,5 @@ changes instead of whitespace. Tests are the ones you write in `tests/`.
 
 ## Docs
 
-- [docs/branch-protection.md](docs/branch-protection.md) - the rules on `main`
-  and how they were configured.
+- [docs/branch-protection.md](docs/branch-protection.md) - the intended rules on
+  `main`, and what is blocking them.

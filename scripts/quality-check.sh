@@ -1,45 +1,36 @@
 #!/usr/bin/env bash
+# Runs the project's automated checks. This is what CI runs, so if it passes
+# here it should pass on your pull request.
+#
+#   scripts/quality-check.sh                lint + formatting + tests
+#   scripts/quality-check.sh --pre-commit   lint + formatting only (fast)
+#
+# The pre-commit hook uses the fast form so committing stays quick. Tests still
+# run in CI, and you can run them yourself with scripts/test.sh.
 set -euo pipefail
 
-has_command() {
-  command -v "$1" > /dev/null 2>&1
-}
+source "$(dirname "${BASH_SOURCE[0]}")/_python.sh"
 
-run_node_script_if_present() {
-  local script_name="$1"
+pre_commit=false
+if [[ "${1:-}" == "--pre-commit" ]]; then
+  pre_commit=true
+fi
 
-  if [[ ! -f package.json ]]; then
-    return 0
-  fi
+# Lint: catches unused imports, undefined names, and other common mistakes.
+echo "Linting..."
+"$PYTHON" -m ruff check .
 
-  if ! node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts['$script_name'] ? 0 : 1)" 2> /dev/null; then
-    return 0
-  fi
+# Formatting: checks the code matches the project's style without changing it.
+# Run `scripts/format.sh` to fix anything this reports.
+echo "Checking formatting..."
+"$PYTHON" -m ruff format --check .
 
-  if [[ -f pnpm-lock.yaml ]]; then
-    if ! has_command pnpm && has_command corepack; then
-      corepack enable
-    fi
-    if ! has_command pnpm; then
-      echo "pnpm-lock.yaml found, but pnpm is not installed." >&2
-      exit 1
-    fi
-    pnpm run "$script_name"
-  elif [[ -f yarn.lock ]]; then
-    if ! has_command yarn && has_command corepack; then
-      corepack enable
-    fi
-    if ! has_command yarn; then
-      echo "yarn.lock found, but yarn is not installed." >&2
-      exit 1
-    fi
-    yarn "$script_name"
-  else
-    npm run "$script_name"
-  fi
-}
+if [[ "$pre_commit" == true ]]; then
+  echo "Quality checks completed (tests skipped for pre-commit)."
+  exit 0
+fi
 
-run_node_script_if_present lint
-run_node_script_if_present test
+echo "Running tests..."
+"$PYTHON" -m pytest
 
 echo "Quality checks completed."

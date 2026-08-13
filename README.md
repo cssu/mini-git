@@ -94,5 +94,10 @@ changes instead of whitespace. Tests are the ones you write in `tests/`.
 
 ## Docs
 
+- [Onboarding guide](https://docs.google.com/document/d/1D77Ncmtunxj7GVADytHo1An6BKzaV-Ep7AxAYfL405k/edit?tab=t.0) -
+  start here if you are new: setup, branching, workflow, pull requests, code
+  review, and coding standards.
+- [Project description](https://docs.google.com/document/d/16OqU5R1x6is5E-2ZWk4KoWDouUU8gCKNzJvW7LTXJtI/edit?tab=t.0#heading=h.m3v17fze97bb) -
+  the full explanation of what we are building and why.
 - [docs/branch-protection.md](docs/branch-protection.md) - the rules on `main`
   and the merge settings, and how to change them.

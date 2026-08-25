@@ -11,8 +11,9 @@ import argparse
 import sys
 from collections.abc import Sequence
 
-from minigit import __version__, objects
+from minigit import __version__
 from minigit.errors import MiniGitError
+from minigit.objects import register_subcommands
 
 
 def _register_commands(subparsers) -> None:
@@ -27,7 +28,7 @@ def _register_commands(subparsers) -> None:
             parser.set_defaults(handler=cmd_add)
     """
 
-    objects.register_subcommands(subparsers)
+    register_subcommands(subparsers)
 
 
 def build_parser() -> argparse.ArgumentParser:

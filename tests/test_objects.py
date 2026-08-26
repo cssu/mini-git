@@ -78,7 +78,8 @@ def test_hash_object_cli_print(tmp_path, capsys):
 
     captured = capsys.readouterr()
     obj_hash = captured.out.strip()
-    assert len(obj_hash) == 40  # SHA-1 hash length
+
+    assert len(obj_hash) == 40  # SHA-1 hash length of 40
 
 
 def test_cat_file_cli_print(tmp_path, capsys):

@@ -71,7 +71,7 @@ def run_hash_object(args) -> int:
 
 def run_cat_file(args) -> int:
     """
-    Print the contents of the object with the given hash. 
+    Print the contents of the object with the given hash.
     """
     _, obj_data = _cli_store.read_object(args.hash)
     print(obj_data.decode("utf-8", errors="replace"), end="")

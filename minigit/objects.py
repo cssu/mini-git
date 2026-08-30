@@ -59,6 +59,9 @@ _cli_store = ObjectStore()
 
 
 def run_hash_object(args) -> int:
+    """
+    Hash the file at args.path, write it to the object store, and print the hash.
+    """
     with open(args.path, "rb") as f:
         data = f.read()
     obj_hash = _cli_store.write_object(data, "blob")
@@ -67,12 +70,18 @@ def run_hash_object(args) -> int:
 
 
 def run_cat_file(args) -> int:
+    """
+    Print the contents of the object with the given hash. 
+    """
     _, obj_data = _cli_store.read_object(args.hash)
     print(obj_data.decode("utf-8", errors="replace"), end="")
     return 0
 
 
 def register_subcommands(subparsers):
+    """
+    Register the "hash-object" and "cat-file" subcommands with the given subparsers object.
+    """
     hash_parser = subparsers.add_parser("hash-object")
     hash_parser.add_argument("path")
     hash_parser.set_defaults(handler=run_hash_object)

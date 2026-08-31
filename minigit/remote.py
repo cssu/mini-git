@@ -17,7 +17,7 @@ from minigit.errors import NetworkProtocolError
 
 
 class RemoteClient:
-    """..."""
+    """Push and pull commits between two minigit repos over a TCP connection."""
 
     def __init__(self, repo_path=".", store=None, commits=None):
 
@@ -50,9 +50,8 @@ class RemoteClient:
             raise NetworkProtocolError
 
     def push(self, remote_address: str, branch: str, token: str) -> None:
-        """
-        ...
-        """
+        """Send local commits on `branch` to the remote, rejecting if it has diverged."""
+
         host, port = self._parse_address(remote_address)
         if len(token) == 0:
             raise NetworkProtocolError
@@ -66,7 +65,8 @@ class RemoteClient:
         # move the remote ref LAST, only after every object arrived
 
     def pull(self, remote_address: str, branch: str, token: str) -> None:
-        """..."""
+        """Fetch `branch` from the remote and update the matching local ref."""
+
         host, port = self._parse_address(remote_address)
         if len(token) == 0:
             raise NetworkProtocolError
@@ -86,7 +86,8 @@ class RemoteClient:
 
 
 def register_subcommands(subparsers) -> None:
-    """..."""
+    """Register the `push` and `pull` subcommands with the CLI parser."""
+
     push_parser = subparsers.add_parser("push", help="push a branch to a remote")
     push_parser.add_argument("address")
     push_parser.add_argument("branch")
@@ -101,12 +102,14 @@ def register_subcommands(subparsers) -> None:
 
 
 def cmd_push(args) -> int:
-    """..."""
+    """Handle `minigit push` from the CLI."""
+
     RemoteClient().push(args.address, args.branch, args.token)
     return 0
 
 
 def cmd_pull(args) -> int:
-    """..."""
+    """Handle `minigit pull` from the CLI."""
+
     RemoteClient().pull(args.address, args.branch, args.token)
     return 0

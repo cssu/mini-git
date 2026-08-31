@@ -29,7 +29,7 @@ class RemoteClient:
         # self.store = store if store is not None else ObjectStore(self.repo_path)
         # self.commits = commits if commits is not None else CommitManager(self.repo_path)
 
-    def parse_address(self, address: str) -> tuple[str, int]:
+    def _parse_address(self, address: str) -> tuple[str, int]:
         """split a string address by host part(string) and the port part(integer)"""
 
         parts = address.rsplit(":", 1)
@@ -53,7 +53,7 @@ class RemoteClient:
         """
         ...
         """
-        host, port = self.parse_address(remote_address)
+        host, port = self._parse_address(remote_address)
         if len(token) == 0:
             raise NetworkProtocolError
         print(f"push: would push {branch} to {host}:{port}")
@@ -67,7 +67,7 @@ class RemoteClient:
 
     def pull(self, remote_address: str, branch: str, token: str) -> None:
         """..."""
-        host, port = self.parse_address(remote_address)
+        host, port = self._parse_address(remote_address)
         if len(token) == 0:
             raise NetworkProtocolError
         print(f"pull: would pull {branch} from {host}:{port}")

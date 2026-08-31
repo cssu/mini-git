@@ -13,6 +13,7 @@ from collections.abc import Sequence
 
 from minigit import __version__
 from minigit.errors import MiniGitError
+from minigit.remote import register_subcommands as register_remote_commands
 
 
 def _register_commands(subparsers) -> None:
@@ -26,6 +27,7 @@ def _register_commands(subparsers) -> None:
             parser.add_argument("path")
             parser.set_defaults(handler=cmd_add)
     """
+    register_remote_commands(subparsers)
 
 
 def build_parser() -> argparse.ArgumentParser:

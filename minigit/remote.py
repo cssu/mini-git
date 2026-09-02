@@ -34,7 +34,7 @@ class RemoteClient:
 
         parts = address.rsplit(":", 1)
         if len(parts) != 2:
-            raise NetworkProtocolError
+            raise NetworkProtocolError(f"address must be host:port, got {address!r}")
 
         host, port = parts
         if host and port:
@@ -43,18 +43,18 @@ class RemoteClient:
                 if 1 <= int_port <= 65535:
                     return host, int_port
                 else:
-                    raise NetworkProtocolError
+                    raise NetworkProtocolError(f"port out of range 1-65535: {port}")
             else:
-                raise NetworkProtocolError
+                raise NetworkProtocolError(f"port is not a number: {port!r}")
         else:
-            raise NetworkProtocolError
+            raise NetworkProtocolError(f"address must be host:port, got {address!r}")
 
     def push(self, remote_address: str, branch: str, token: str) -> None:
         """Send local commits on `branch` to the remote, rejecting if it has diverged."""
 
         host, port = self._parse_address(remote_address)
         if len(token) == 0:
-            raise NetworkProtocolError
+            raise NetworkProtocolError("push needs a token: pass --token")
         print(f"push: would push {branch} to {host}:{port}")
 
         # connect over TCP
@@ -69,7 +69,7 @@ class RemoteClient:
 
         host, port = self._parse_address(remote_address)
         if len(token) == 0:
-            raise NetworkProtocolError
+            raise NetworkProtocolError("pull needs a token: pass --token")
         print(f"pull: would pull {branch} from {host}:{port}")
         # Week 6 - same exchange in reverse
 

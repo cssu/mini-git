@@ -13,6 +13,8 @@ from collections.abc import Sequence
 
 from minigit import __version__, commits
 from minigit.errors import MiniGitError
+from minigit.index import register_index_commands
+from minigit.objects import register_subcommands as register_object_commands
 
 
 def _register_commands(subparsers) -> None:
@@ -26,6 +28,8 @@ def _register_commands(subparsers) -> None:
             parser.add_argument("path")
             parser.set_defaults(handler=cmd_add)
     """
+    register_object_commands(subparsers)
+    register_index_commands(subparsers)
     commits.register_subcommands(subparsers)
 
 

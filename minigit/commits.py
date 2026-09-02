@@ -13,9 +13,8 @@ import os
 import time
 
 from minigit.errors import RefNotFoundError
-
-# from minigit.objects import ObjectStore
-# from minigit.index import WorkingTree
+from minigit.index import WorkingTree
+from minigit.objects import ObjectStore
 
 
 def _cmd_commit(args) -> int:
@@ -78,15 +77,8 @@ class CommitManager:
         self.root = os.path.abspath(repo_path)
         self._refs = {}
         self._head = "main"
-        if store is not None:
-            self.store = store
-        # else:
-        #     self.store = ObjectStore(repo_path)
-
-        if tree is not None:
-            self.tree = tree
-        # else:
-        #     self.tree = WorkingTree(repo_path)
+        self.store = store if store is not None else ObjectStore(repo_path)
+        self.tree = tree if tree is not None else WorkingTree(repo_path)
 
     def _format_commit(self, tree_hash, parents, author, message) -> str:
         """Format commit object as a string"""
@@ -115,7 +107,7 @@ class CommitManager:
     def switch_branch(self, name) -> None:
         """Switch to a branch"""
         if name not in self._refs:
-            raise RefNotFoundError
+            raise RefNotFoundError(name)
         self._head = name
 
     def list_branches(self) -> list[str]:

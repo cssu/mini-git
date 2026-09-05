@@ -137,6 +137,9 @@ def test_file_overwrite(tmp_path):
 
 
 def test_duplicate_write_leaves_one_object_file(tmp_path):
+    """
+    Test that writing the same object twice leaves only one object file in the object store.
+    """
     store = ObjectStore(tmp_path)
 
     obj_hash = store.write_object(b"hi", "blob")

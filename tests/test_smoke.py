@@ -24,6 +24,9 @@ def test_cli_without_a_command_prints_help(capsys):
 
 
 def test_init_creates_repository_layout(tmp_path, monkeypatch, capsys):
+    """
+    Test that the init command creates the expected repository layout.
+    """
     monkeypatch.chdir(tmp_path)
 
     assert main(["init"]) == 0

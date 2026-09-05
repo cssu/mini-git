@@ -21,11 +21,11 @@ from minigit.remote import register_subcommands as register_remote_commands
 
 def _init_repository(args) -> int:
     """
-    Initialize a new minigit repository in the current directory. 
+    Initialize a new minigit repository in the current directory.
     If a repository already exists, print a message and return 0.
     """
     metadata_dir = Path(".minigit")
-    
+
     if metadata_dir.exists():
         print("already a minigit repository")
         return 0

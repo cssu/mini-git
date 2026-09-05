@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from minigit.cli import main
-from minigit.errors import ObjectNotFoundError
+from minigit.errors import ObjectCorruptError, ObjectNotFoundError
 from minigit.objects import ObjectStore
 
 
@@ -96,3 +96,56 @@ def test_cat_file_cli_print(tmp_path, capsys):
     assert main(["cat-file", obj_hash]) == 0
     captured = capsys.readouterr()
     assert captured.out == "hello minigit"
+
+
+def test_hash_correctness(tmp_path):
+    """
+    Test that the hash of a known object is correct.
+    """
+
+    store = ObjectStore(tmp_path)
+
+    assert store.hash_object(b"hi", "blob") == "32f95c0d1244a78b2be1bab8de17906fabb2c4a8"
+    assert store.hash_object(b"", "blob") == "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+
+
+def test_object_compressed(tmp_path):
+    """
+    Test that the compressed object does not equal the content.
+    """
+
+    store = ObjectStore(tmp_path)
+    obj_hash = store.write_object(b"hi", "blob")
+    object_path = store._object_path(obj_hash)
+
+    compressed_data = object_path.read_bytes()
+    assert compressed_data != b"hi"
+
+
+def test_file_overwrite(tmp_path):
+    """
+    Test that overwriting an existing object raises ObjectCorruptError.
+    """
+
+    store = ObjectStore(tmp_path)
+    obj_hash = store.write_object(b"hi", "blob")
+
+    store._object_path(obj_hash).write_bytes(b"junk")
+
+    with pytest.raises(ObjectCorruptError):
+        store.read_object(obj_hash)
+
+
+def test_duplicate_write_leaves_one_object_file(tmp_path):
+    """
+    Test that writing the same object twice leaves only one object file in the object store.
+    """
+    store = ObjectStore(tmp_path)
+
+    obj_hash = store.write_object(b"hi", "blob")
+    assert store.write_object(b"hi", "blob") == obj_hash
+
+    assert list((tmp_path / ".minigit" / "objects").rglob("*")) == [
+        store._object_path(obj_hash).parent,
+        store._object_path(obj_hash),
+    ]

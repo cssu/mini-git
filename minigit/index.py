@@ -170,6 +170,7 @@ def cmd_status(args) -> int:
 
     return 0
 
+
 def register_index_commands(subparsers) -> None:
     add_parser = subparsers.add_parser("add", help="stage a file")
     add_parser.add_argument("path")

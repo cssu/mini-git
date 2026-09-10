@@ -16,6 +16,32 @@ import os
 from minigit.errors import NetworkProtocolError
 
 
+def send_line(sock, text: str) -> None:
+    """Send one line of the wire protocol,"""
+
+    sock.sendall((text + "\n").encode())
+
+
+def receive_line(sock, buf: bytearray) -> str:
+    """Read one `\\n`-terminated line from `sock`.
+
+    `buf` is the connection's leftover-bytes buffer, owned by the caller and
+    reused across calls on the same socket: a `recv()` can return two lines
+    at once (the second one waits here for the next call) or half a line
+    (we keep reading until the rest arrives).
+    """
+
+    while b"\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise NetworkProtocolError("connection closed mid-line")
+        buf.extend(chunk)
+
+    line, _, rest = buf.partition(b"\n")
+    buf[:] = rest
+    return line.decode()
+
+
 class RemoteClient:
     """Push and pull commits between two minigit repos over a TCP connection."""
 

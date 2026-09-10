@@ -12,6 +12,7 @@ Build the `RemoteClient` class here, per the interface contract.
 # from .objects import ObjectStore  (Module 1 & 3)
 # from .commits import CommitManager
 import os
+import socket
 
 from minigit.errors import NetworkProtocolError
 
@@ -98,6 +99,21 @@ class RemoteClient:
             raise NetworkProtocolError("pull needs a token: pass --token")
         print(f"pull: would pull {branch} from {host}:{port}")
         # Week 6 - same exchange in reverse
+
+
+class RemoteServer:
+    """Accepts a RemoteClient's AUTH + REF handshake over TCP, one client at a time."""
+
+    def __init__(self, repo_path=".", token="", host="127.0.0.1", port=0):
+        self.repo_path = repo_path
+        self.token = token
+        self.host = host
+
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind((host, port))
+        self._sock.listen()
+        self.port = self._sock.getsockname()[1]
 
 
 # Wire protocol (draft only - Week 2 makes this real):

@@ -12,8 +12,35 @@ Build the `RemoteClient` class here, per the interface contract.
 # from .objects import ObjectStore  (Module 1 & 3)
 # from .commits import CommitManager
 import os
+import socket
 
 from minigit.errors import NetworkProtocolError
+
+
+def send_line(sock, text: str) -> None:
+    """Send one line of the wire protocol,"""
+
+    sock.sendall((text + "\n").encode())
+
+
+def receive_line(sock, buf: bytearray) -> str:
+    """Read one `\\n`-terminated line from `sock`.
+
+    `buf` is the connection's leftover-bytes buffer, owned by the caller and
+    reused across calls on the same socket: a `recv()` can return two lines
+    at once (the second one waits here for the next call) or half a line
+    (we keep reading until the rest arrives).
+    """
+
+    while b"\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise NetworkProtocolError("connection closed mid-line")
+        buf.extend(chunk)
+
+    line, _, rest = buf.partition(b"\n")
+    buf[:] = rest
+    return line.decode()
 
 
 class RemoteClient:
@@ -55,10 +82,27 @@ class RemoteClient:
         host, port = self._parse_address(remote_address)
         if len(token) == 0:
             raise NetworkProtocolError("push needs a token: pass --token")
-        print(f"push: would push {branch} to {host}:{port}")
 
-        # connect over TCP
-        # ask remote for its current hash for <branch>
+        try:
+            sock = socket.create_connection((host, port), timeout=5)
+        except OSError as exc:
+            raise NetworkProtocolError(f"could not connect to {host}:{port}: {exc}") from exc
+
+        try:
+            buf = bytearray()
+            send_line(sock, f"AUTH {token}")
+            reply = receive_line(sock, buf)
+            if reply != "OK":
+                raise NetworkProtocolError(f"auth failed: {reply}")
+
+            send_line(sock, f"REF {branch}")
+            reply = receive_line(sock, buf)
+            remote_hash = reply.rsplit(" ", 1)[1]
+            print(f"remote {branch} is at {remote_hash}")
+            print("# Week 6 - send missing objects, move the ref last")
+        finally:
+            sock.close()
+
         # remote hash not an ancestor of local -> someone else pushed first -> NetworkProtocolError
         # walk local commit graph from remote's hash up to local -> collect reachable objects
         # send only the missing objects
@@ -70,8 +114,96 @@ class RemoteClient:
         host, port = self._parse_address(remote_address)
         if len(token) == 0:
             raise NetworkProtocolError("pull needs a token: pass --token")
-        print(f"pull: would pull {branch} from {host}:{port}")
-        # Week 6 - same exchange in reverse
+
+        try:
+            sock = socket.create_connection((host, port), timeout=5)
+        except OSError as exc:
+            raise NetworkProtocolError(f"could not connect to {host}:{port}: {exc}") from exc
+
+        try:
+            buf = bytearray()
+            send_line(sock, f"AUTH {token}")
+            reply = receive_line(sock, buf)
+            if reply != "OK":
+                raise NetworkProtocolError(f"auth failed: {reply}")
+
+            send_line(sock, f"REF {branch}")
+            reply = receive_line(sock, buf)
+            remote_hash = reply.rsplit(" ", 1)[1]
+            print(f"remote {branch} is at {remote_hash}")
+            print("# Week 6 - same exchange in reverse")
+        finally:
+            sock.close()
+
+
+class RemoteServer:
+    """Accepts a RemoteClient's AUTH + REF handshake over TCP, one client at a time."""
+
+    def __init__(self, repo_path=".", token="", host="127.0.0.1", port=0):
+        self.repo_path = repo_path
+        self.token = token
+        self.host = host
+
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind((host, port))
+        self._sock.listen()
+        # accept() polls this instead of blocking forever: closing the socket
+        # from another thread isn't guaranteed to unblock a pending accept()
+        # on every platform (it does on macOS, not reliably on Linux).
+        self._sock.settimeout(0.5)
+        self.port = self._sock.getsockname()[1]
+        self._closed = False
+
+    def close(self) -> None:
+        """Stop accepting connections. `serve_forever()` notices within one poll interval."""
+
+        self._closed = True
+        self._sock.close()
+
+    def serve_forever(self) -> None:
+        """Accept connections and handle them one at a time until `close()` is called."""
+
+        while not self._closed:
+            try:
+                conn, _ = self._sock.accept()
+            except TimeoutError:
+                continue  # no connection yet - check self._closed and try again
+            except OSError:
+                return  # listening socket was closed - shut down
+
+            try:
+                self._handle_client(conn)
+            except (NetworkProtocolError, OSError):
+                pass  # a bad client must not take down the server
+            finally:
+                conn.close()
+
+    def _handle_client(self, conn) -> None:
+        """Run one client's AUTH + REF handshake."""
+
+        buf = bytearray()
+
+        line = receive_line(conn, buf)
+        command, _, value = line.partition(" ")
+        if command != "AUTH" or value != self.token:
+            send_line(conn, "ERR bad auth")
+            return
+        send_line(conn, "OK")
+
+        line = receive_line(conn, buf)
+        command, _, branch = line.partition(" ")
+        if command != "REF":
+            send_line(conn, "ERR expected REF")
+            return
+
+        ref_path = os.path.join(self.repo_path, ".minigit", "refs", "heads", branch)
+        if os.path.exists(ref_path):
+            with open(ref_path) as f:
+                commit_hash = f.read().strip()
+        else:
+            commit_hash = "-"
+        send_line(conn, f"REF {branch} {commit_hash}")
 
 
 # Wire protocol (draft only - Week 2 makes this real):
@@ -86,7 +218,7 @@ class RemoteClient:
 
 
 def register_subcommands(subparsers) -> None:
-    """Register the `push` and `pull` subcommands with the CLI parser."""
+    """Register the `push`, `pull`, and `serve` subcommands with the CLI parser."""
 
     push_parser = subparsers.add_parser("push", help="push a branch to a remote")
     push_parser.add_argument("address")
@@ -100,6 +232,11 @@ def register_subcommands(subparsers) -> None:
     pull_parser.add_argument("--token", default="")
     pull_parser.set_defaults(handler=cmd_pull)
 
+    serve_parser = subparsers.add_parser("serve", help="serve this repo to push/pull clients")
+    serve_parser.add_argument("--port", type=int, required=True)
+    serve_parser.add_argument("--token", default="")
+    serve_parser.set_defaults(handler=cmd_serve)
+
 
 def cmd_push(args) -> int:
     """Handle `minigit push` from the CLI."""
@@ -112,4 +249,13 @@ def cmd_pull(args) -> int:
     """Handle `minigit pull` from the CLI."""
 
     RemoteClient().pull(args.address, args.branch, args.token)
+    return 0
+
+
+def cmd_serve(args) -> int:
+    """Handle `minigit serve` from the CLI."""
+
+    server = RemoteServer(port=args.port, token=args.token)
+    print(f"listening on {server.host}:{server.port}")
+    server.serve_forever()
     return 0

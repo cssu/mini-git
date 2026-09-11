@@ -114,8 +114,26 @@ class RemoteClient:
         host, port = self._parse_address(remote_address)
         if len(token) == 0:
             raise NetworkProtocolError("pull needs a token: pass --token")
-        print(f"pull: would pull {branch} from {host}:{port}")
-        # Week 6 - same exchange in reverse
+
+        try:
+            sock = socket.create_connection((host, port), timeout=5)
+        except OSError as exc:
+            raise NetworkProtocolError(f"could not connect to {host}:{port}: {exc}") from exc
+
+        try:
+            buf = bytearray()
+            send_line(sock, f"AUTH {token}")
+            reply = receive_line(sock, buf)
+            if reply != "OK":
+                raise NetworkProtocolError(f"auth failed: {reply}")
+
+            send_line(sock, f"REF {branch}")
+            reply = receive_line(sock, buf)
+            remote_hash = reply.rsplit(" ", 1)[1]
+            print(f"remote {branch} is at {remote_hash}")
+            print("# Week 6 - same exchange in reverse")
+        finally:
+            sock.close()
 
 
 class RemoteServer:

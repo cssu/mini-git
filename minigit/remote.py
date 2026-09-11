@@ -210,7 +210,7 @@ class RemoteServer:
 
 
 def register_subcommands(subparsers) -> None:
-    """Register the `push` and `pull` subcommands with the CLI parser."""
+    """Register the `push`, `pull`, and `serve` subcommands with the CLI parser."""
 
     push_parser = subparsers.add_parser("push", help="push a branch to a remote")
     push_parser.add_argument("address")
@@ -224,6 +224,11 @@ def register_subcommands(subparsers) -> None:
     pull_parser.add_argument("--token", default="")
     pull_parser.set_defaults(handler=cmd_pull)
 
+    serve_parser = subparsers.add_parser("serve", help="serve this repo to push/pull clients")
+    serve_parser.add_argument("--port", type=int, required=True)
+    serve_parser.add_argument("--token", default="")
+    serve_parser.set_defaults(handler=cmd_serve)
+
 
 def cmd_push(args) -> int:
     """Handle `minigit push` from the CLI."""
@@ -236,4 +241,13 @@ def cmd_pull(args) -> int:
     """Handle `minigit pull` from the CLI."""
 
     RemoteClient().pull(args.address, args.branch, args.token)
+    return 0
+
+
+def cmd_serve(args) -> int:
+    """Handle `minigit serve` from the CLI."""
+
+    server = RemoteServer(port=args.port, token=args.token)
+    print(f"listening on {server.host}:{server.port}")
+    server.serve_forever()
     return 0

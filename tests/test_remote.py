@@ -3,7 +3,7 @@ import threading
 import pytest
 
 from minigit.errors import NetworkProtocolError
-from minigit.remote import RemoteClient, RemoteServer
+from minigit.remote import RemoteClient, RemoteServer, receive_line
 
 KNOWN_HASH = "a" * 40
 
@@ -100,3 +100,21 @@ def test_push_closed_port_raises_network_protocol_error(remote_server):
     client = make_client()
     with pytest.raises(NetworkProtocolError):
         client.push(f"127.0.0.1:{port}", "main", "tok")
+
+
+class FakeSocket:
+    """Hands back pre-scripted chunks instead of reading a real socket."""
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    def recv(self, size):
+        return self._chunks.pop(0) if self._chunks else b""
+
+
+def test_receive_line_splits_two_lines_from_one_packet():
+    sock = FakeSocket([b"AUTH tok\nREF main\n"])
+    buf = bytearray()
+
+    assert receive_line(sock, buf) == "AUTH tok"
+    assert receive_line(sock, buf) == "REF main"

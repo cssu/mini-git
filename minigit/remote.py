@@ -82,10 +82,27 @@ class RemoteClient:
         host, port = self._parse_address(remote_address)
         if len(token) == 0:
             raise NetworkProtocolError("push needs a token: pass --token")
-        print(f"push: would push {branch} to {host}:{port}")
 
-        # connect over TCP
-        # ask remote for its current hash for <branch>
+        try:
+            sock = socket.create_connection((host, port), timeout=5)
+        except OSError as exc:
+            raise NetworkProtocolError(f"could not connect to {host}:{port}: {exc}") from exc
+
+        try:
+            buf = bytearray()
+            send_line(sock, f"AUTH {token}")
+            reply = receive_line(sock, buf)
+            if reply != "OK":
+                raise NetworkProtocolError(f"auth failed: {reply}")
+
+            send_line(sock, f"REF {branch}")
+            reply = receive_line(sock, buf)
+            remote_hash = reply.rsplit(" ", 1)[1]
+            print(f"remote {branch} is at {remote_hash}")
+            print("# Week 6 - send missing objects, move the ref last")
+        finally:
+            sock.close()
+
         # remote hash not an ancestor of local -> someone else pushed first -> NetworkProtocolError
         # walk local commit graph from remote's hash up to local -> collect reachable objects
         # send only the missing objects

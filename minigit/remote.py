@@ -148,19 +148,27 @@ class RemoteServer:
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind((host, port))
         self._sock.listen()
+        # accept() polls this instead of blocking forever: closing the socket
+        # from another thread isn't guaranteed to unblock a pending accept()
+        # on every platform (it does on macOS, not reliably on Linux).
+        self._sock.settimeout(0.5)
         self.port = self._sock.getsockname()[1]
+        self._closed = False
 
     def close(self) -> None:
-        """Stop accepting connections. Unblocks a `serve_forever()` running on another thread."""
+        """Stop accepting connections. `serve_forever()` notices within one poll interval."""
 
+        self._closed = True
         self._sock.close()
 
     def serve_forever(self) -> None:
         """Accept connections and handle them one at a time until `close()` is called."""
 
-        while True:
+        while not self._closed:
             try:
                 conn, _ = self._sock.accept()
+            except TimeoutError:
+                continue  # no connection yet - check self._closed and try again
             except OSError:
                 return  # listening socket was closed - shut down
 

@@ -29,6 +29,7 @@ def remote_server(tmp_path):
     server = RemoteServer(repo_path=str(tmp_path), token="tok", port=0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    server._thread = thread  # test-only: lets a test wait for a manual close() to land
 
     yield server
 
@@ -97,6 +98,7 @@ def test_push_missing_branch_prints_dash(remote_server, capsys):
 def test_push_closed_port_raises_network_protocol_error(remote_server):
     port = remote_server.port
     remote_server.close()
+    remote_server._thread.join(timeout=2)  # wait for serve_forever() to actually exit
     client = make_client()
     with pytest.raises(NetworkProtocolError):
         client.push(f"127.0.0.1:{port}", "main", "tok")

@@ -132,6 +132,27 @@ class RemoteServer:
         self._sock.listen()
         self.port = self._sock.getsockname()[1]
 
+    def close(self) -> None:
+        """Stop accepting connections. Unblocks a `serve_forever()` running on another thread."""
+
+        self._sock.close()
+
+    def serve_forever(self) -> None:
+        """Accept connections and handle them one at a time until `close()` is called."""
+
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return  # listening socket was closed - shut down
+
+            try:
+                self._handle_client(conn)
+            except (NetworkProtocolError, OSError):
+                pass  # a bad client must not take down the server
+            finally:
+                conn.close()
+
 
 # Wire protocol (draft only - Week 2 makes this real):
 # One message per line, UTF-8 encoded, terminated with "\n".

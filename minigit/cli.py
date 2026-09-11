@@ -10,12 +10,32 @@ Every handler takes the parsed args and returns an exit code (0 = success).
 import argparse
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 from minigit import __version__, commits
 from minigit.errors import MiniGitError
 from minigit.index import register_index_commands
 from minigit.objects import register_subcommands as register_object_commands
 from minigit.remote import register_subcommands as register_remote_commands
+
+
+def _init_repository(args) -> int:
+    """
+    Initialize a new minigit repository in the current directory.
+    If a repository already exists, print a message and return 0.
+    """
+    metadata_dir = Path(".minigit")
+
+    if metadata_dir.exists():
+        print("already a minigit repository")
+        return 0
+
+    (metadata_dir / "objects").mkdir(parents=True)
+    (metadata_dir / "refs" / "heads").mkdir(parents=True)
+    (metadata_dir / "index").write_bytes(b"")
+    (metadata_dir / "config").write_bytes(b"")
+    (metadata_dir / "HEAD").write_text("ref: refs/heads/main\n")
+    return 0
 
 
 def _register_commands(subparsers) -> None:
@@ -29,6 +49,9 @@ def _register_commands(subparsers) -> None:
             parser.add_argument("path")
             parser.set_defaults(handler=cmd_add)
     """
+    init_parser = subparsers.add_parser("init", help="create a minigit repository")
+    init_parser.set_defaults(handler=_init_repository)
+
     register_object_commands(subparsers)
     register_index_commands(subparsers)
     commits.register_subcommands(subparsers)

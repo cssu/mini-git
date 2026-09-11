@@ -86,8 +86,8 @@ class WorkingTree:
         else:
             mode = "100644"
 
-        entries = [e for e in self.read_index() if e.path != path]
-        entries.append(IndexEntry(mode, blob_hash, path))
+        entries = [e for e in self.read_index() if e.path != rel_path]
+        entries.append(IndexEntry(mode, blob_hash, rel_path))
         self.write_index(entries)
 
     def build_tree_from_index(self) -> str:

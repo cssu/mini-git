@@ -31,6 +31,24 @@ def test_staging_twice(tmp_path):
     assert len(entries) == 1
 
 
+def test_staging_equivalent_paths_updates_one_entry(tmp_path):
+    file = tmp_path / "hello.txt"
+    file.write_text("original")
+    wt = WorkingTree(repo_path=str(tmp_path))
+    wt.stage_file("hello.txt")
+
+    file.write_text("updated")
+    wt.stage_file("./hello.txt")
+
+    entries = wt.read_index()
+    assert len(entries) == 1
+    assert entries[0].path == "hello.txt"
+    assert wt.store.read_object(entries[0].hash) == ("blob", b"updated")
+    status = wt._working_status()
+    assert status.added == []
+    assert status.modified == []
+
+
 def test_index_file(tmp_path):
     (tmp_path / "z.txt").write_text("z")
     store = ObjectStore(str(tmp_path))

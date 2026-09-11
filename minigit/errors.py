@@ -22,6 +22,10 @@ class RefNotFoundError(MiniGitError):
     """A ref (branch, HEAD target, tag) does not exist."""
 
 
+class RefExistsError(MiniGitError):
+    """A branch or ref with this name already exists."""
+
+
 class MergeConflictError(MiniGitError):
     """A merge could not complete automatically.
 

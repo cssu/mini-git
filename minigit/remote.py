@@ -153,6 +153,32 @@ class RemoteServer:
             finally:
                 conn.close()
 
+    def _handle_client(self, conn) -> None:
+        """Run one client's AUTH + REF handshake."""
+
+        buf = bytearray()
+
+        line = receive_line(conn, buf)
+        command, _, value = line.partition(" ")
+        if command != "AUTH" or value != self.token:
+            send_line(conn, "ERR bad auth")
+            return
+        send_line(conn, "OK")
+
+        line = receive_line(conn, buf)
+        command, _, branch = line.partition(" ")
+        if command != "REF":
+            send_line(conn, "ERR expected REF")
+            return
+
+        ref_path = os.path.join(self.repo_path, ".minigit", "refs", "heads", branch)
+        if os.path.exists(ref_path):
+            with open(ref_path) as f:
+                commit_hash = f.read().strip()
+        else:
+            commit_hash = "-"
+        send_line(conn, f"REF {branch} {commit_hash}")
+
 
 # Wire protocol (draft only - Week 2 makes this real):
 # One message per line, UTF-8 encoded, terminated with "\n".

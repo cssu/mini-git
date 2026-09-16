@@ -12,8 +12,16 @@ Build the `ObjectStore` class here, per the interface contract.
 import hashlib
 import zlib
 from pathlib import Path
+from typing import NamedTuple
 
 from minigit.errors import ObjectCorruptError, ObjectNotFoundError
+
+
+class TreeEntry(NamedTuple):
+    mode: str
+    type: str
+    hash: str
+    name: str
 
 
 class ObjectStore:
@@ -82,6 +90,88 @@ class ObjectStore:
         Return the path to the object with the given hash.
         """
         return self.objects_dir / hash[:2] / hash[2:]
+
+    @staticmethod
+    def _validate_tree_entry(entry: TreeEntry) -> None:
+        """
+        Helper Method
+        Validates a TreeEntry object for correct mode/type, hash, and name.
+        """
+        if (entry.mode, entry.type) not in {
+            ("100644", "blob"),
+            ("100755", "blob"),
+            ("40000", "tree"),
+        }:
+            raise ValueError
+        if len(entry.hash) != 40 or any(
+            character not in "0123456789abcdef" for character in entry.hash
+        ):
+            raise ValueError
+        if entry.name in {"", ".", ".."} or any(character in entry.name for character in "/\t\r\n"):
+            raise ValueError
+
+    def write_tree(self, entries: list[TreeEntry]) -> str:
+        """
+        Writes a list of TreeEntry objects to the object store in name-sorted order.
+        Returns the hash of the tree object.
+        Raises ValueError for incorrectly formatted entries.
+        """
+
+        sorted_entries = sorted(entries, key=lambda entry: entry.name)
+
+        names = set()
+        for entry in sorted_entries:
+            self._validate_tree_entry(entry)
+            if entry.name in names:
+                raise ValueError
+            names.add(entry.name)
+
+        tree_data = b"".join(
+            f"{entry.mode} {entry.type} {entry.hash}\t{entry.name}\n".encode()
+            for entry in sorted_entries
+        )
+        return self.write_object(tree_data, "tree")
+
+    def read_tree(self, tree_hash: str) -> list[TreeEntry]:
+        """
+        Reads a tree object from the object store and returns a list of TreeEntry objects.
+        Raises ObjectCorruptError if the object is not a tree or is incorrectly formatted.
+        """
+
+        obj_type, tree_data = self.read_object(tree_hash)
+
+        if obj_type != "tree":
+            raise ObjectCorruptError(tree_hash)
+
+        entries = []
+
+        try:
+            lines = tree_data.decode("utf-8").splitlines(keepends=True)
+
+            names = set()
+
+            for line in lines:
+                if not line.endswith("\n") or line.endswith("\r\n"):
+                    raise ValueError
+
+                fields, separator, name = line[:-1].partition("\t")
+                if not separator:
+                    raise ValueError
+
+                mode, entry_type, entry_hash = fields.split(" ")
+                entry = TreeEntry(mode, entry_type, entry_hash, name)
+                self._validate_tree_entry(entry)
+
+                if name in names:
+                    raise ValueError
+
+                names.add(name)
+                entries.append(entry)
+
+        except (UnicodeDecodeError, ValueError):
+            raise ObjectCorruptError(tree_hash) from None
+
+        return entries
 
 
 def run_hash_object(args) -> int:

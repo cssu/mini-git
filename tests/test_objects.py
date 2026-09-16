@@ -6,7 +6,7 @@ import pytest
 
 from minigit.cli import main
 from minigit.errors import ObjectCorruptError, ObjectNotFoundError
-from minigit.objects import ObjectStore
+from minigit.objects import ObjectStore, TreeEntry
 
 
 def test_round_trip(tmp_path: Path) -> None:
@@ -149,3 +149,125 @@ def test_duplicate_write_leaves_one_object_file(tmp_path):
         store._object_path(obj_hash).parent,
         store._object_path(obj_hash),
     ]
+
+
+def test_writing_empty_tree(tmp_path):
+    """
+    Tests that writing an empty tree returns a valid hash and can be read back.
+    """
+    store = ObjectStore(tmp_path)
+
+    tree_hash = store.write_tree([])
+
+    assert store.read_object(tree_hash) == ("tree", b"")
+    assert store.read_tree(tree_hash) == []
+
+
+def test_tree_round_trip_supports_nested_references_executable_and_spaces(tmp_path):
+    """
+    Tests that writing a tree with nested references,
+    executable files, and spaces in names can be read back correctly
+    """
+    store = ObjectStore(tmp_path)
+    blob_hash = "a" * 40
+    nested_hash = store.write_tree([TreeEntry("100644", "blob", blob_hash, "child")])
+    entries = [
+        TreeEntry("100755", "blob", blob_hash, "run script"),
+        TreeEntry("40000", "tree", nested_hash, "nested"),
+    ]
+
+    tree_hash = store.write_tree(entries)
+
+    assert store.read_tree(tree_hash) == [entries[1], entries[0]]
+
+
+def test_tree_hash_is_deterministic_across_input_order(tmp_path):
+    """
+    Tests that writing a tree with the same entries in different orders produces the same hash.
+    """
+    store = ObjectStore(tmp_path)
+    entries = [
+        TreeEntry("100644", "blob", "a" * 40, "z.txt"),
+        TreeEntry("100644", "blob", "b" * 40, "a.txt"),
+    ]
+
+    assert store.write_tree(entries) == store.write_tree(list(reversed(entries)))
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        TreeEntry("100600", "blob", "a" * 40, "file"),
+        TreeEntry("100644", "commit", "a" * 40, "file"),
+        TreeEntry("100644", "blob", "a" * 39, "file"),
+        TreeEntry("100644", "blob", "g" * 40, "file"),
+        TreeEntry("100644", "blob", "a" * 40, ""),
+        TreeEntry("100644", "blob", "a" * 40, "dir/file"),
+        TreeEntry("100644", "blob", "a" * 40, "."),
+        TreeEntry("100644", "blob", "a" * 40, ".."),
+        TreeEntry("100644", "blob", "a" * 40, "has\t tab"),
+        TreeEntry("100644", "blob", "a" * 40, "has\nnewline"),
+    ],
+)
+def test_write_tree_rejects_malformed_entries(tmp_path, entry):
+    """
+    Tests that writing a tree with incorrectly formatted entries raises a ValueError.
+    """
+    with pytest.raises(ValueError):
+        ObjectStore(tmp_path).write_tree([entry])
+
+
+@pytest.mark.parametrize(
+    "tree_data",
+    [
+        b"100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa no-tab\n",
+        b"100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t\n",
+        b"100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tdup\n"
+        b"100644 blob bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tdup\n",
+        b"100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tfile\n",
+        b"100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tfile",
+        b"100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tfile\r\n",
+        b"\xff",
+    ],
+)
+def test_read_tree_rejects_malformed_data(tmp_path, tree_data):
+    """
+    Tests that reading a tree with incorrectly formatted data raises an ObjectCorruptError
+    """
+    store = ObjectStore(tmp_path)
+    tree_hash = store.write_object(tree_data, "tree")
+
+    with pytest.raises(ObjectCorruptError):
+        store.read_tree(tree_hash)
+
+
+def test_read_tree_rejects_non_tree_object(tmp_path):
+    """
+    Tests that reading a tree from a non-tree object raises an ObjectCorruptError
+    """
+    store = ObjectStore(tmp_path)
+    blob_hash = store.write_object(b"content", "blob")
+
+    with pytest.raises(ObjectCorruptError):
+        store.read_tree(blob_hash)
+
+
+def test_read_tree_missing_object(tmp_path):
+    """
+    Tests that reading a non-existent tree raises an ObjectNotFoundError.
+    """
+    with pytest.raises(ObjectNotFoundError):
+        ObjectStore(tmp_path).read_tree("a" * 40)
+
+
+def test_tree_round_trip_with_new_store(tmp_path):
+    """
+    Tests that writing a tree and reading it back with a new ObjectStore instance works correctly.
+    """
+    entries = [TreeEntry("100644", "blob", "a" * 40, "file")]
+    first_store = ObjectStore(tmp_path)
+    tree_hash = first_store.write_tree(entries)
+
+    second_store = ObjectStore(tmp_path)
+
+    assert second_store.read_tree(tree_hash) == entries

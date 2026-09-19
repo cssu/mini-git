@@ -172,6 +172,7 @@ def test_diff_no_changes_reports_nothing(tmp_path):
 # minigit.commits.get_head_tree isn't merged yet, so these tests fake it with
 # monkeypatch
 
+
 def _fake_commits_module(monkeypatch, head_tree_hash):
     """Install a fake minigit.commits module with a get_head_tree() that
     returns the given value (None for 'unborn HEAD', or a tree hash str)."""

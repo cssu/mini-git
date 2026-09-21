@@ -301,3 +301,20 @@ def test_fresh_manager_reads_same_history(tmp_path):
     m1.create_commit(tree, [a], AUTHOR, "b")
     m2 = make_manager(tmp_path)
     assert m2.log() == m1.log()
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "tree invalid\nauthor Test 1\ncommitter Test 1",
+        f"tree {'a' * 40}\nparent invalid\nauthor Test 1\ncommitter Test 1",
+        f"tree {'a' * 40}\nauthor Test\ncommitter Test 1",
+        f"tree {'a' * 40}\nauthor Test 1\ncommitter Test invalid",
+        f"tree {'a' * 40}\nauthor Test 1\ncommitter Test 1\nextra header",
+    ],
+)
+def test_read_commit_rejects_invalid_headers(tmp_path, header):
+    manager = make_manager(tmp_path)
+    obj_hash = manager.store.write_object((header + "\n\nmessage").encode(), "commit")
+    with pytest.raises(ObjectCorruptError):
+        manager.read_commit(obj_hash)

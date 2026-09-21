@@ -109,7 +109,7 @@ class CommitManager:
     def __init__(self, repo_path=".", store=None, tree=None):
         self.root = os.path.abspath(repo_path)
         self.store = store if store is not None else ObjectStore(repo_path)
-        self.tree = tree if tree is not None else WorkingTree(repo_path)
+        self.tree = tree if tree is not None else WorkingTree(repo_path, store=self.store)
 
     def _format_commit(self, tree_hash, parents, author, message) -> str:
         """Format commit object as a string"""
@@ -208,13 +208,23 @@ class CommitManager:
                 parents.append(lines[i][len("parent ") :])
                 i += 1
             if not lines[i].startswith("author "):
-                raise ValueError("mising author line")
+                raise ValueError("missing author line")
             author = lines[i][len("author ") :].rsplit(" ", 1)[0]
             i += 1
 
             if not lines[i].startswith("committer "):
                 raise ValueError("missing committer line")
             committer = lines[i][len("committer ") :].rsplit(" ", 1)[0]
+            if i != len(lines) - 1:
+                raise ValueError("unexpected commit headers")
+            for object_hash in [tree, *parents]:
+                if len(object_hash) != 40 or any(c not in "0123456789abcdef" for c in object_hash):
+                    raise ValueError("invalid object hash")
+            for identity_line in lines[-2:]:
+                identity, timestamp = identity_line.split(" ", 1)[1].rsplit(" ", 1)
+                if not identity.strip():
+                    raise ValueError("missing identity")
+                int(timestamp)
 
         except (UnicodeDecodeError, IndexError, ValueError) as error:
             raise ObjectCorruptError(commit_hash) from error

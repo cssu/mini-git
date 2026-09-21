@@ -271,3 +271,15 @@ def test_tree_round_trip_with_new_store(tmp_path):
     second_store = ObjectStore(tmp_path)
 
     assert second_store.read_tree(tree_hash) == entries
+
+
+@pytest.mark.parametrize("name", ["vertical\vtab", "form\ffeed", "unicode\u2028separator"])
+def test_tree_round_trip_preserves_non_delimiter_characters(tmp_path, name):
+    store = ObjectStore(tmp_path)
+    entries = [TreeEntry("100644", "blob", "a" * 40, name)]
+    assert store.read_tree(store.write_tree(entries)) == entries
+
+
+def test_tree_rejects_null_in_filename(tmp_path):
+    with pytest.raises(ValueError):
+        ObjectStore(tmp_path).write_tree([TreeEntry("100644", "blob", "a" * 40, "bad\0name")])

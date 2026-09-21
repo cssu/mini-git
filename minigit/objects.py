@@ -107,7 +107,9 @@ class ObjectStore:
             character not in "0123456789abcdef" for character in entry.hash
         ):
             raise ValueError
-        if entry.name in {"", ".", ".."} or any(character in entry.name for character in "/\t\r\n"):
+        if entry.name in {"", ".", ".."} or any(
+            character in entry.name for character in "/\0\t\r\n"
+        ):
             raise ValueError
 
     def write_tree(self, entries: list[TreeEntry]) -> str:
@@ -146,15 +148,18 @@ class ObjectStore:
         entries = []
 
         try:
-            lines = tree_data.decode("utf-8").splitlines(keepends=True)
+            text = tree_data.decode("utf-8")
+            if text and not text.endswith("\n"):
+                raise ValueError
+            lines = text.split("\n")[:-1]
 
             names = set()
 
             for line in lines:
-                if not line.endswith("\n") or line.endswith("\r\n"):
+                if line.endswith("\r"):
                     raise ValueError
 
-                fields, separator, name = line[:-1].partition("\t")
+                fields, separator, name = line.partition("\t")
                 if not separator:
                     raise ValueError
 

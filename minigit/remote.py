@@ -13,7 +13,7 @@ import os
 import socket
 
 from minigit.commits import CommitManager
-from minigit.errors import NetworkProtocolError, ObjectNotFoundError
+from minigit.errors import NetworkProtocolError, ObjectCorruptError, ObjectNotFoundError
 from minigit.objects import ObjectStore
 
 
@@ -40,7 +40,10 @@ def receive_line(sock, buf: bytearray) -> str:
 
     line, _, rest = buf.partition(b"\n")
     buf[:] = rest
-    return line.decode()
+    try:
+        return line.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise NetworkProtocolError("protocol line is not UTF-8") from exc
 
 
 def recv_exact(sock, buf: bytearray, size: int) -> bytes:
@@ -69,7 +72,9 @@ class RemoteClient:
         self.repo_path = repo_path
         self.config_path = os.path.join(self.repo_path, ".minigit", "config")
         self.store = store if store is not None else ObjectStore(self.repo_path)
-        self.commits = commits if commits is not None else CommitManager(self.repo_path)
+        self.commits = (
+            commits if commits is not None else CommitManager(self.repo_path, store=self.store)
+        )
 
     def _parse_address(self, address: str) -> tuple[str, int]:
         """split a string address by host part(string) and the port part(integer)"""
@@ -197,7 +202,9 @@ class RemoteClient:
             raise NetworkProtocolError(f"expected OBJ, got {header!r}")
 
         obj_type, _, length_text = rest.partition(" ")
-        if not obj_type or not length_text.isdigit():
+        if obj_type not in {"blob", "tree", "commit"} or not (
+            length_text.isascii() and length_text.isdigit()
+        ):
             raise NetworkProtocolError(f"malformed OBJ header: {header!r}")
 
         content = recv_exact(sock, buf, int(length_text))
@@ -211,9 +218,6 @@ class RemoteClient:
 
         Local-only this week: this is what push will later diff against the
         remote's advertised hash to find what's actually missing there.
-        Written against M1's `read_tree` (#16) and M3's `read_commit` /
-        `walk_history` (#18), which haven't merged yet - real integration
-        follows once they do.
         """
 
         tip = self.commits.read_ref(branch)
@@ -315,6 +319,13 @@ class RemoteServer:
     def _send_ref(self, conn, branch: str) -> None:
         """Reply with the commit hash `branch` currently points at, or `-` if it has none."""
 
+        if (
+            not branch
+            or any(part in {"", ".", ".."} for part in branch.split("/"))
+            or any(char in branch for char in "\0\\\r\n")
+        ):
+            send_line(conn, "ERR invalid branch")
+            return
         ref_path = os.path.join(self.repo_path, ".minigit", "refs", "heads", branch)
         if os.path.exists(ref_path):
             with open(ref_path) as f:
@@ -326,10 +337,17 @@ class RemoteServer:
     def _send_object(self, conn, obj_hash: str) -> None:
         """Reply with the requested object's bytes, or `ERR` if it isn't in the store."""
 
+        if len(obj_hash) != 40 or any(c not in "0123456789abcdef" for c in obj_hash):
+            send_line(conn, "ERR invalid object hash")
+            return
         try:
             obj_type, content = self.store.read_object(obj_hash)
         except ObjectNotFoundError:
             send_line(conn, f"ERR unknown object {obj_hash}")
+            return
+
+        except ObjectCorruptError:
+            send_line(conn, f"ERR corrupt object {obj_hash}")
             return
 
         send_line(conn, f"OBJ {obj_type} {len(content)}")

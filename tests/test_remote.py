@@ -417,3 +417,32 @@ def test_collect_reachable_includes_both_merge_parents():
         "blob-a",
         "blob-b",
     }
+
+
+def test_receive_line_invalid_utf8_is_protocol_error():
+    with pytest.raises(NetworkProtocolError):
+        receive_line(FakeSocket([b"\xff\n"]), bytearray())
+
+
+@pytest.mark.parametrize("header", [b"OBJ blob \xc2\xb2\n", b"OBJ unknown 0\n"])
+def test_receive_object_rejects_invalid_type_and_unicode_length(header):
+    with pytest.raises(NetworkProtocolError):
+        make_client()._receive_object(FakeReceiveSocket(header), bytearray(), "a" * 40)
+
+
+def test_server_survives_corrupt_objects_and_invalid_requests(remote_server):
+    store = ObjectStore(remote_server.repo_path)
+    bad_hash = store.write_object(b"broken", "blob")
+    store._object_path(bad_hash).write_bytes(b"not compressed")
+    good_hash = store.write_object(b"good", "blob")
+    with socket.create_connection(("127.0.0.1", remote_server.port), timeout=5) as sock:
+        buf = bytearray()
+        send_line(sock, "AUTH tok")
+        assert receive_line(sock, buf) == "OK"
+        for request in [f"WANT {bad_hash}", "WANT ../../config", "REF ../../config"]:
+            send_line(sock, request)
+            assert receive_line(sock, buf).startswith("ERR ")
+        send_line(sock, f"WANT {good_hash}")
+        assert receive_line(sock, buf) == "OBJ blob 4"
+        assert recv_exact(sock, buf, 4) == b"good"
+        send_line(sock, "DONE")

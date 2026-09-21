@@ -1,8 +1,6 @@
 """Tests for minigit/index.py - WorkingTree, trees, diffing, and status."""
 
-import sys
-import types
-
+from minigit.commits import CommitManager
 from minigit.index import WorkingTree, cmd_status
 from minigit.objects import ObjectStore
 
@@ -168,17 +166,7 @@ def test_diff_no_changes_reports_nothing(tmp_path):
     assert diff.modified == []
 
 
-# --- cmd_status ---
-# minigit.commits.get_head_tree isn't merged yet, so these tests fake it with
-# monkeypatch
-
-
-def _fake_commits_module(monkeypatch, head_tree_hash):
-    """Install a fake minigit.commits module with a get_head_tree() that
-    returns the given value (None for 'unborn HEAD', or a tree hash str)."""
-    fake_module = types.ModuleType("minigit.commits")
-    fake_module.get_head_tree = lambda: head_tree_hash
-    monkeypatch.setitem(sys.modules, "minigit.commits", fake_module)
+# --- cmd_status against real commit objects ---
 
 
 class _Args:
@@ -195,7 +183,7 @@ def test_status_clean_after_commit(tmp_path, monkeypatch, capsys):
     tree_hash = wt.build_tree_from_index()
 
     monkeypatch.chdir(tmp_path)
-    _fake_commits_module(monkeypatch, tree_hash)
+    CommitManager(tmp_path).create_commit(tree_hash, [], "Test", "initial")
 
     cmd_status(_Args())
 
@@ -220,7 +208,7 @@ def test_status_staged_and_unstaged_on_one_file(tmp_path, monkeypatch, capsys):
     file.write_text("v3")
 
     monkeypatch.chdir(tmp_path)
-    _fake_commits_module(monkeypatch, committed_tree_hash)
+    CommitManager(tmp_path).create_commit(committed_tree_hash, [], "Test", "initial")
 
     cmd_status(_Args())
 
@@ -238,10 +226,36 @@ def test_status_unborn_head_shows_all_staged(tmp_path, monkeypatch, capsys):
     wt.stage_file("hello.txt")
 
     monkeypatch.chdir(tmp_path)
-    _fake_commits_module(monkeypatch, None)  # unborn HEAD
 
     cmd_status(_Args())
 
     output = capsys.readouterr().out
     assert "staged:" in output
     assert "hello.txt" in output
+
+
+def test_status_and_diff_do_not_store_unstaged_content(tmp_path, monkeypatch, capsys):
+    file = tmp_path / "file"
+    file.write_text("committed")
+    wt = WorkingTree(tmp_path)
+    wt.stage_file("file")
+    tree = wt.build_tree_from_index()
+    CommitManager(tmp_path).create_commit(tree, [], "Test", "initial")
+    before = set(wt.store.objects_dir.rglob("*"))
+    file.write_text("unstaged")
+    monkeypatch.chdir(tmp_path)
+    cmd_status(_Args())
+    assert capsys.readouterr().out == "not staged:\n  file\n"
+    assert wt.diff_working_tree_vs(tree).modified == ["file"]
+    assert set(wt.store.objects_dir.rglob("*")) == before
+
+
+def test_status_reports_file_removed_from_index_as_untracked(tmp_path, monkeypatch, capsys):
+    (tmp_path / "file").write_text("content")
+    wt = WorkingTree(tmp_path)
+    wt.stage_file("file")
+    CommitManager(tmp_path).create_commit(wt.build_tree_from_index(), [], "Test", "initial")
+    wt.write_index([])
+    monkeypatch.chdir(tmp_path)
+    cmd_status(_Args())
+    assert capsys.readouterr().out == "staged:\n  file\nuntracked:\n  file\n"

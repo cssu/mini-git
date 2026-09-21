@@ -146,7 +146,7 @@ class WorkingTree:
             else:
                 with open(full_path, "rb") as f:
                     data = f.read()
-                current_hash = self.store.write_object(data, "blob")
+                current_hash = self.store.hash_object(data, "blob")
                 current_mode = "100755" if os.access(full_path, os.X_OK) else "100644"
                 if current_hash != entry.hash or current_mode != entry.mode:
                     result.modified.append(entry.path)
@@ -176,8 +176,9 @@ class WorkingTree:
             else:
                 with open(full_path, "rb") as f:
                     data = f.read()
-                current_hash = self.store.write_object(data, "blob")
-                if current_hash != entry.hash:
+                current_hash = self.store.hash_object(data, "blob")
+                current_mode = "100755" if os.access(full_path, os.X_OK) else "100644"
+                if current_hash != entry.hash or current_mode != entry.mode:
                     result.modified.append(entry.path)
 
         for dirpath, dirnames, filenames in os.walk(self.root):
@@ -205,9 +206,9 @@ def cmd_status(args) -> int:
     index_entries = wt.read_index()
     index_by_path = {e.path: e for e in index_entries}
 
-    from minigit.commits import get_head_tree
+    from minigit.commits import CommitManager
 
-    head_tree_hash = get_head_tree()
+    head_tree_hash = CommitManager(wt.root, store=wt.store, tree=wt).get_head_tree()
     head_entries = wt.read_tree_entries(head_tree_hash) if head_tree_hash else []
     head_by_path = {e.path: e for e in head_entries}
 
@@ -230,13 +231,13 @@ def cmd_status(args) -> int:
         else:
             with open(full_path, "rb") as f:
                 data = f.read()
-            current_hash = wt.store.write_object(data, "blob")
+            current_hash = wt.store.hash_object(data, "blob")
             current_mode = "100755" if os.access(full_path, os.X_OK) else "100644"
             if current_hash != entry.hash or current_mode != entry.mode:
                 not_staged_paths.add(entry.path)
 
-    # untracked: on disk, absent from both index and HEAD
-    known_paths = set(index_by_path) | set(head_by_path)
+    # untracked: on disk, absent from the index
+    known_paths = set(index_by_path)
     untracked_paths = set()
     for dirpath, dirnames, filenames in os.walk(wt.root):
         dirnames[:] = [d for d in dirnames if d != ".minigit"]

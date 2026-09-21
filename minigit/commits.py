@@ -12,7 +12,7 @@ Build the `CommitManager` class here, per the interface contract.
 import os
 import time
 
-from minigit.errors import MiniGitError, RefExistsError, RefNotFoundError
+from minigit.errors import MiniGitError, ObjectCorruptError, RefExistsError, RefNotFoundError
 from minigit.index import WorkingTree
 from minigit.objects import ObjectStore
 
@@ -94,6 +94,15 @@ def register_subcommands(subparsers) -> None:
 
     log_parser = subparsers.add_parser("log", help="show commit history")
     log_parser.set_defaults(handler=_cmd_log)
+
+
+class CommitData:
+    def __init__(self, tree: str, parents: list[str], author: str, committer: str, message: str):
+        self.tree = tree
+        self.parents = parents
+        self.author = author
+        self.committer = committer
+        self.message = message
 
 
 class CommitManager:
@@ -179,6 +188,67 @@ class CommitManager:
         """Return the name of the branch HEAD currently points at."""
         return self.read_head() or "main"
 
+    def read_commit(self, commit_hash: str) -> CommitData:
+
+        obj_type, data = self.store.read_object(commit_hash)
+        if obj_type != "commit":
+            raise ObjectCorruptError(commit_hash)
+        try:
+            body = data.decode()
+            header, message = body.split("\n\n", 1)
+            lines = header.splitlines()
+
+            if not lines[0].startswith("tree "):
+                raise ValueError("missing tree line")
+            tree = lines[0][len("tree ") :]
+
+            i = 1
+            parents = []
+            while lines[i].startswith("parent "):
+                parents.append(lines[i][len("parent ") :])
+                i += 1
+            if not lines[i].startswith("author "):
+                raise ValueError("mising author line")
+            author = lines[i][len("author ") :].rsplit(" ", 1)[0]
+            i += 1
+
+            if not lines[i].startswith("committer "):
+                raise ValueError("missing committer line")
+            committer = lines[i][len("committer ") :].rsplit(" ", 1)[0]
+
+        except (UnicodeDecodeError, IndexError, ValueError) as error:
+            raise ObjectCorruptError(commit_hash) from error
+
+        return CommitData(tree, parents, author, committer, message)
+
+    def get_head_tree(self) -> str | None:
+        head = self._current_branch()
+        if os.path.exists(self._ref_path(head)):
+            commit_hash = self.read_ref(head)
+        elif len(head) == 40:
+            commit_hash = head
+        else:
+            return None
+
+        return self.read_commit(commit_hash).tree
+
+    def walk_history(self, start_hash: str) -> list[str]:
+        visited = []
+        seen = set()
+        stack = [start_hash]
+
+        while stack:
+            commit_hash = stack.pop()
+            if commit_hash in seen:
+                continue
+            seen.add(commit_hash)
+            visited.append(commit_hash)
+
+            parents = self.read_commit(commit_hash).parents
+            stack.extend(reversed(parents))
+
+        return visited
+
     def create_commit(self, tree_hash, parents, author, message) -> str:
         """
         Create a new commit object, write it to the object store, and advance
@@ -187,6 +257,10 @@ class CommitManager:
         The caller is responsible for resolving `parents` (e.g. via `read_ref`
         on the current branch, or `[]` for a root commit).
         """
+        obj_type, _ = self.store.read_object(tree_hash)
+        if obj_type != "tree":
+            raise ObjectCorruptError(tree_hash)
+
         branch = self._current_branch()
         body = self._format_commit(tree_hash, parents, author, message)
         commit_hash = self.store.write_object(body.encode(), "commit")
@@ -219,24 +293,17 @@ class CommitManager:
 
     def log(self) -> list[str]:
         """Return one summary line per commit reachable from HEAD, newest first"""
-
-        branch = self._current_branch()
-        commit_hash = self.read_ref(branch)
+        commit_hash = self.read_ref(self._current_branch())
         if not commit_hash:
             return []
 
         lines = []
-        while commit_hash:
-            _, data = self.store.read_object(commit_hash)
-            body = data.decode()
-            message = body.split("\n\n", 1)[1].splitlines()[0]
-            lines.append(f"{commit_hash[:7]} {message}")
-
-            parent_hash = None
-            for line in body.splitlines():
-                if line.startswith("parent "):
-                    parent_hash = line.split(" ", 1)[1]
-                    break
-            commit_hash = parent_hash
+        for i in self.walk_history(commit_hash):
+            msg = self.read_commit(i).message
+            if msg:
+                summary = msg.splitlines()[0]
+            else:
+                summary = ""
+            lines.append(f"{i[:7]} {summary}")
 
         return lines

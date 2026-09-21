@@ -91,17 +91,84 @@ class WorkingTree:
         self.write_index(entries)
 
     def build_tree_from_index(self) -> str:
-        return self.store.write_object(b"", "tree")
+        from minigit.objects import TreeEntry
+
+        entries = self.read_index()
+
+        root: dict = {}
+        for entry in entries:
+            parts = entry.path.split("/")
+            current = root
+            for part in parts[:-1]:
+                current = current.setdefault(part, {})
+            current[parts[-1]] = entry
+
+        def write_dir(node: dict) -> str:
+            tree_entries = []
+            for name in sorted(node.keys()):
+                value = node[name]
+                if isinstance(value, dict):
+                    subtree_hash = write_dir(value)
+                    tree_entries.append(
+                        TreeEntry(mode="40000", type="tree", hash=subtree_hash, name=name)
+                    )
+                else:
+                    tree_entries.append(
+                        TreeEntry(mode=value.mode, type="blob", hash=value.hash, name=name)
+                    )
+            return self.store.write_tree(tree_entries)
+
+        return write_dir(root)
+
+    def read_tree_entries(self, tree_hash: str) -> list[IndexEntry]:
+        entries = []
+
+        def walk(hash_, prefix):
+            for te in self.store.read_tree(hash_):
+                path = f"{prefix}/{te.name}" if prefix else te.name
+                if te.type == "tree":
+                    walk(te.hash, path)
+                else:
+                    entries.append(IndexEntry(te.mode, te.hash, path))
+
+        walk(tree_hash, "")
+        return sorted(entries, key=lambda e: e.path)
 
     def diff_working_tree_vs(self, tree_hash) -> DiffResult:
-        return DiffResult([], [], [])
+        result = DiffResult([], [], [])
+        tree_entries = self.read_tree_entries(tree_hash)
+        known_paths = {e.path for e in tree_entries}
+
+        for entry in tree_entries:
+            full_path = os.path.join(self.root, entry.path)
+            if not os.path.isfile(full_path):
+                result.deleted.append(entry.path)
+            else:
+                with open(full_path, "rb") as f:
+                    data = f.read()
+                current_hash = self.store.hash_object(data, "blob")
+                current_mode = "100755" if os.access(full_path, os.X_OK) else "100644"
+                if current_hash != entry.hash or current_mode != entry.mode:
+                    result.modified.append(entry.path)
+
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = [d for d in dirnames if d != ".minigit"]
+            for filename in filenames:
+                full_path = os.path.join(dirpath, filename)
+                rel_path = os.path.relpath(full_path, self.root).replace(os.sep, "/")
+                if rel_path not in known_paths:
+                    result.added.append(rel_path)
+
+        result.added.sort()
+        result.deleted.sort()
+        result.modified.sort()
+        return result
 
     def _working_status(self) -> DiffResult:
         result = DiffResult([], [], [])
         entries = self.read_index()
         known_paths = {e.path for e in entries}
 
-        # check staged entries against disk
         for entry in entries:
             full_path = f"{self.root}/{entry.path}"
             if not os.path.isfile(full_path):
@@ -109,11 +176,11 @@ class WorkingTree:
             else:
                 with open(full_path, "rb") as f:
                     data = f.read()
-                current_hash = self.store.write_object(data, "blob")
-                if current_hash != entry.hash:
+                current_hash = self.store.hash_object(data, "blob")
+                current_mode = "100755" if os.access(full_path, os.X_OK) else "100644"
+                if current_hash != entry.hash or current_mode != entry.mode:
                     result.modified.append(entry.path)
 
-        # walk the working tree for untracked files
         for dirpath, dirnames, filenames in os.walk(self.root):
             dirnames[:] = [d for d in dirnames if d != ".minigit"]
             for filename in filenames:
@@ -136,14 +203,53 @@ def cmd_add(args) -> int:
 
 def cmd_status(args) -> int:
     wt = WorkingTree()
-    result = wt._working_status()
-    entries = wt.read_index()
+    index_entries = wt.read_index()
+    index_by_path = {e.path: e for e in index_entries}
 
-    # build each category once, upfront
-    changed_paths = result.modified + result.deleted
-    staged = [e.path for e in entries if e.path not in changed_paths]
-    not_staged = sorted(changed_paths)
-    untracked = sorted(result.added)
+    from minigit.commits import CommitManager
+
+    head_tree_hash = CommitManager(wt.root, store=wt.store, tree=wt).get_head_tree()
+    head_entries = wt.read_tree_entries(head_tree_hash) if head_tree_hash else []
+    head_by_path = {e.path: e for e in head_entries}
+
+    # staged: HEAD tree vs index
+    staged_paths = set()
+    for path, entry in index_by_path.items():
+        head_entry = head_by_path.get(path)
+        if head_entry is None or head_entry.hash != entry.hash or head_entry.mode != entry.mode:
+            staged_paths.add(path)
+    for path in head_by_path:
+        if path not in index_by_path:
+            staged_paths.add(path)
+
+    # not staged: index vs disk
+    not_staged_paths = set()
+    for entry in index_entries:
+        full_path = os.path.join(wt.root, entry.path)
+        if not os.path.isfile(full_path):
+            not_staged_paths.add(entry.path)
+        else:
+            with open(full_path, "rb") as f:
+                data = f.read()
+            current_hash = wt.store.hash_object(data, "blob")
+            current_mode = "100755" if os.access(full_path, os.X_OK) else "100644"
+            if current_hash != entry.hash or current_mode != entry.mode:
+                not_staged_paths.add(entry.path)
+
+    # untracked: on disk, absent from the index
+    known_paths = set(index_by_path)
+    untracked_paths = set()
+    for dirpath, dirnames, filenames in os.walk(wt.root):
+        dirnames[:] = [d for d in dirnames if d != ".minigit"]
+        for filename in filenames:
+            full_path = os.path.join(dirpath, filename)
+            rel_path = os.path.relpath(full_path, wt.root).replace(os.sep, "/")
+            if rel_path not in known_paths:
+                untracked_paths.add(rel_path)
+
+    staged = sorted(staged_paths)
+    not_staged = sorted(not_staged_paths)
+    untracked = sorted(untracked_paths)
 
     printed_anything = False
 

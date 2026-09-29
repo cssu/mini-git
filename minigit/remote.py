@@ -65,6 +65,37 @@ def recv_exact(sock, buf: bytearray, size: int) -> bytes:
     return data
 
 
+def _has_object(store, obj_hash: str) -> bool:
+    """Return whether `obj_hash` already exists in `store`.
+
+    Prefers `store.has_object` (Module 1, #22) once the injected store has
+    grown one; falls back to a real read so this works against `main` today.
+    """
+
+    has_object = getattr(store, "has_object", None)
+    if has_object is not None:
+        return has_object(obj_hash)
+    try:
+        store.read_object(obj_hash)
+        return True
+    except ObjectNotFoundError:
+        return False
+
+
+def _is_ancestor(commits, ancestor_hash: str, descendant_hash: str) -> bool:
+    """Return whether `ancestor_hash` is reachable from `descendant_hash`.
+
+    Prefers `commits.is_ancestor` (Module 3, #24) once the injected commits
+    manager has grown one; falls back to `walk_history` so this works
+    against `main` today.
+    """
+
+    is_ancestor = getattr(commits, "is_ancestor", None)
+    if is_ancestor is not None:
+        return is_ancestor(ancestor_hash, descendant_hash)
+    return ancestor_hash in commits.walk_history(descendant_hash)
+
+
 class RemoteClient:
     """Push and pull commits between two minigit repos over a TCP connection."""
 
@@ -97,11 +128,24 @@ class RemoteClient:
             raise NetworkProtocolError(f"address must be host:port, got {address!r}")
 
     def push(self, remote_address: str, branch: str, token: str) -> None:
-        """Send local commits on `branch` to the remote, rejecting if it has diverged."""
+        """Send local commits on `branch` to the remote, rejecting if it has diverged.
+
+        Resolves the local tip and authenticates, then reads the remote's
+        current tip through `REF`. Equal tips mean nothing to do; a remote
+        tip that is not an ancestor of the local tip means someone else
+        pushed first, and the push is rejected. Otherwise every object
+        reachable from `branch` that the remote doesn't already have is
+        uploaded (`HAVE`/`PUT`), and the ref only moves after `DONE` reports
+        the transfer validated on the far side.
+        """
 
         host, port = self._parse_address(remote_address)
         if len(token) == 0:
             raise NetworkProtocolError("push needs a token: pass --token")
+
+        local_hash = self.commits.read_ref(branch)
+        if local_hash is None:
+            raise NetworkProtocolError(f"local branch {branch!r} has no commits to push")
 
         try:
             sock = socket.create_connection((host, port), timeout=5)
@@ -118,15 +162,54 @@ class RemoteClient:
             send_line(sock, f"REF {branch}")
             reply = receive_line(sock, buf)
             remote_hash = reply.rsplit(" ", 1)[1]
-            print(f"remote {branch} is at {remote_hash}")
-            print("# Week 6 - send missing objects, move the ref last")
+
+            if remote_hash == local_hash:
+                print(f"{branch} is up to date")
+                return
+
+            if remote_hash != "-" and not _is_ancestor(self.commits, remote_hash, local_hash):
+                raise NetworkProtocolError(
+                    f"remote {branch} has diverged from local: "
+                    f"{remote_hash} is not an ancestor of {local_hash}"
+                )
+
+            send_line(sock, f"PUSH {branch} {remote_hash} {local_hash}")
+            reply = receive_line(sock, buf)
+            if reply != "OK":
+                raise NetworkProtocolError(f"push rejected: {reply}")
+
+            for obj_hash in self.collect_reachable(branch):
+                send_line(sock, f"HAVE {obj_hash}")
+                reply = receive_line(sock, buf)
+                if reply == "NO":
+                    self._put_object(sock, buf, obj_hash)
+                elif reply != "YES":
+                    raise NetworkProtocolError(f"expected YES or NO, got {reply!r}")
+
+            send_line(sock, "DONE")
+            reply = receive_line(sock, buf)
+            if reply != "OK":
+                raise NetworkProtocolError(f"push failed: {reply}")
+
+            print(f"{branch} now at {local_hash}")
+        except NetworkProtocolError:
+            raise
+        except (OSError, ObjectNotFoundError, ObjectCorruptError) as exc:
+            raise NetworkProtocolError(f"push to {host}:{port} failed: {exc}") from exc
         finally:
             sock.close()
 
-        # remote hash not an ancestor of local -> someone else pushed first -> NetworkProtocolError
-        # walk local commit graph from remote's hash up to local -> collect reachable objects
-        # send only the missing objects
-        # move the remote ref LAST, only after every object arrived
+    def _put_object(self, sock, buf: bytearray, obj_hash: str) -> None:
+        """Send `PUT <hash>` followed by the object's `OBJ` header and bytes."""
+
+        obj_type, content = self.store.read_object(obj_hash)
+        send_line(sock, f"PUT {obj_hash}")
+        send_line(sock, f"OBJ {obj_type} {len(content)}")
+        sock.sendall(content)
+
+        reply = receive_line(sock, buf)
+        if reply != "OK":
+            raise NetworkProtocolError(f"remote rejected {obj_hash}: {reply}")
 
     def pull(self, remote_address: str, branch: str, token: str) -> None:
         """Fetch `branch` from the remote and update the matching local ref."""
@@ -249,11 +332,14 @@ class RemoteClient:
 class RemoteServer:
     """Accepts a RemoteClient's AUTH + REF handshake over TCP, one client at a time."""
 
-    def __init__(self, repo_path=".", token="", host="127.0.0.1", port=0, store=None):
+    def __init__(self, repo_path=".", token="", host="127.0.0.1", port=0, store=None, commits=None):
         self.repo_path = repo_path
         self.token = token
         self.host = host
         self.store = store if store is not None else ObjectStore(repo_path)
+        self.commits = (
+            commits if commits is not None else CommitManager(repo_path, store=self.store)
+        )
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -312,8 +398,11 @@ class RemoteServer:
                 self._send_ref(conn, value)
             elif command == "WANT":
                 self._send_object(conn, value)
+            elif command == "PUSH":
+                self._handle_push(conn, buf, value)
+                return
             else:
-                send_line(conn, "ERR expected REF, WANT, or DONE")
+                send_line(conn, "ERR expected REF, WANT, PUSH, or DONE")
                 return
 
     def _send_ref(self, conn, branch: str) -> None:
@@ -326,13 +415,134 @@ class RemoteServer:
         ):
             send_line(conn, "ERR invalid branch")
             return
-        ref_path = os.path.join(self.repo_path, ".minigit", "refs", "heads", branch)
-        if os.path.exists(ref_path):
-            with open(ref_path) as f:
-                commit_hash = f.read().strip()
-        else:
-            commit_hash = "-"
+        commit_hash = self.commits.read_ref(branch) or "-"
         send_line(conn, f"REF {branch} {commit_hash}")
+
+    def _handle_push(self, conn, buf: bytearray, args: str) -> None:
+        """Handle a PUSH sub-session: HAVE/PUT exchange, then validate and move the ref.
+
+        `args` is `"<branch> <old-hash|-> <new-hash>"`. A failure anywhere in
+        here - a stale old ref, a bad object, a dropped connection - leaves
+        the ref untouched; any objects already stored are simply left in
+        place for a retry to reuse.
+        """
+
+        try:
+            branch, old_hash, new_hash = args.split(" ")
+        except ValueError:
+            send_line(conn, "ERR malformed PUSH")
+            return
+
+        if (
+            not branch
+            or any(part in {"", ".", ".."} for part in branch.split("/"))
+            or any(char in branch for char in "\0\\\r\n")
+        ):
+            send_line(conn, "ERR invalid branch")
+            return
+        if len(new_hash) != 40 or any(c not in "0123456789abcdef" for c in new_hash):
+            send_line(conn, "ERR invalid new hash")
+            return
+
+        expected_old = None if old_hash == "-" else old_hash
+        if self.commits.read_ref(branch) != expected_old:
+            send_line(conn, f"ERR {branch} changed: expected {old_hash}")
+            return
+
+        send_line(conn, "OK")
+
+        while True:
+            line = receive_line(conn, buf)
+            command, _, value = line.partition(" ")
+
+            if command == "HAVE":
+                send_line(conn, "YES" if _has_object(self.store, value) else "NO")
+            elif command == "PUT":
+                if not self._receive_pushed_object(conn, buf, value):
+                    return
+            elif command == "DONE":
+                break
+            else:
+                send_line(conn, "ERR expected HAVE, PUT, or DONE")
+                return
+
+        # Recheck the ref hasn't moved since we accepted the PUSH - another
+        # client's push could have landed while we were receiving objects.
+        if self.commits.read_ref(branch) != expected_old:
+            send_line(conn, "ERR ref changed during push")
+            return
+
+        try:
+            self._validate_history(new_hash)
+        except (ObjectNotFoundError, ObjectCorruptError) as exc:
+            send_line(conn, f"ERR incomplete history: {exc}")
+            return
+
+        if expected_old is not None and not _is_ancestor(self.commits, expected_old, new_hash):
+            send_line(conn, "ERR not a fast-forward")
+            return
+
+        self.commits.write_ref(branch, new_hash)
+        send_line(conn, "OK")
+
+    def _receive_pushed_object(self, conn, buf: bytearray, expected_hash: str) -> bool:
+        """Read one `PUT`'s `OBJ` header and bytes, hash-check, and store it.
+
+        Replies `OK`/`ERR` itself (mirroring `_send_object`'s style) and
+        returns whether it succeeded, so the caller knows to stop the
+        session on failure.
+        """
+
+        if len(expected_hash) != 40 or any(c not in "0123456789abcdef" for c in expected_hash):
+            send_line(conn, "ERR invalid object hash")
+            return False
+
+        header = receive_line(conn, buf)
+        command, _, rest = header.partition(" ")
+        if command != "OBJ":
+            send_line(conn, "ERR expected OBJ")
+            return False
+
+        obj_type, _, length_text = rest.partition(" ")
+        if obj_type not in {"blob", "tree", "commit"} or not (
+            length_text.isascii() and length_text.isdigit()
+        ):
+            send_line(conn, "ERR malformed OBJ header")
+            return False
+
+        content = recv_exact(conn, buf, int(length_text))
+        if self.store.hash_object(content, obj_type) != expected_hash:
+            send_line(conn, f"ERR hash mismatch for {expected_hash}")
+            return False
+
+        self.store.write_object(content, obj_type)
+        send_line(conn, "OK")
+        return True
+
+    def _validate_history(self, commit_hash: str) -> None:
+        """Verify every commit, tree, and blob reachable from `commit_hash` exists
+        with the expected type, before the ref is allowed to move.
+        """
+
+        visited_trees: set[str] = set()
+        for c_hash in self.commits.walk_history(commit_hash):
+            commit = self.commits.read_commit(c_hash)
+            self._validate_tree(commit.tree, visited_trees)
+
+    def _validate_tree(self, tree_hash: str, visited: set[str]) -> None:
+        """Add `tree_hash` to `visited` and check everything nested under it, once each."""
+
+        if tree_hash in visited:
+            return
+        visited.add(tree_hash)
+
+        for entry in self.store.read_tree(tree_hash):
+            if entry.type == "tree":
+                self._validate_tree(entry.hash, visited)
+            else:
+                obj_type, _ = self.store.read_object(entry.hash)
+                if obj_type != "blob":
+                    raise ObjectCorruptError(entry.hash)
 
     def _send_object(self, conn, obj_hash: str) -> None:
         """Reply with the requested object's bytes, or `ERR` if it isn't in the store."""
@@ -354,15 +564,22 @@ class RemoteServer:
         conn.sendall(content)
 
 
-# Wire protocol (draft only - Week 2 makes this real):
-# One message per line, UTF-8 encoded, terminated with "\n".
+# Wire protocol: one message per line, UTF-8 encoded, terminated with "\n".
 #
-#   AUTH <token>       - client authenticates the connection with its token
-#   REF <branch>       - ask for / report the commit hash a branch currently points to
-#   WANT <hash>        - request the object with this hash
-#   OBJ <type> <len>   - announces an object is coming next: its type and byte length
-#   DONE               - no more messages from this side
-#   ERR                - something went wrong
+#   AUTH <token>                 - client authenticates the connection with its token
+#   REF <branch>                 - ask for / report the commit hash a branch currently points to
+#   WANT <hash>                  - request the object with this hash (fetch/pull)
+#   PUSH <branch> <old|-> <new>  - propose moving <branch> from <old> ("-" = unborn) to <new>
+#   HAVE <hash>                  - ask whether the remote already has an object
+#   PUT <hash>                   - announce an upload of <hash>, followed by an OBJ header + bytes
+#   OBJ <type> <len>             - announces an object is coming next: its type and byte length
+#   DONE                         - no more messages from this side (also closes a PUSH session)
+#   ERR <reason>                 - something went wrong
+#
+# A push session: AUTH -> REF (read the remote's current tip) -> PUSH
+# (propose the move) -> repeated HAVE/PUT (upload only what the remote is
+# missing) -> DONE (remote validates the new history and moves the ref) ->
+# connection closes.
 
 
 def register_subcommands(subparsers) -> None:

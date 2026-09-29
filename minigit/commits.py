@@ -12,7 +12,12 @@ Build the `CommitManager` class here, per the interface contract.
 import os
 import time
 
-from minigit.errors import MiniGitError, ObjectCorruptError, RefExistsError, RefNotFoundError
+from minigit.errors import (
+    MiniGitError,
+    ObjectCorruptError,
+    RefExistsError,
+    RefNotFoundError,
+)
 from minigit.index import WorkingTree
 from minigit.objects import ObjectStore
 
@@ -76,6 +81,13 @@ def _cmd_checkout(args) -> int:
     return 0
 
 
+def _cmd_merge(args) -> int:
+    manager = CommitManager()
+    manager.merge(args.branch)
+    print(f"Merged '{args.branch}' into '{manager._current_branch()}'")
+    return 0
+
+
 def register_subcommands(subparsers) -> None:
     """
     Register the three commands: commit, branch, checkout
@@ -94,6 +106,10 @@ def register_subcommands(subparsers) -> None:
 
     log_parser = subparsers.add_parser("log", help="show commit history")
     log_parser.set_defaults(handler=_cmd_log)
+
+    merge_parser = subparsers.add_parser("merge", help="fast-forward the current branch")
+    merge_parser.add_argument("branch", help="branch name to merge in")
+    merge_parser.set_defaults(handler=_cmd_merge)
 
 
 class CommitData:
@@ -188,8 +204,32 @@ class CommitManager:
         """Return the name of the branch HEAD currently points at."""
         return self.read_head() or "main"
 
-    def read_commit(self, commit_hash: str) -> CommitData:
+    def _empty_tree_hash(self) -> str:
+        """Return the hash of empty tree, used to stand in for an unborn HEAD"""
+        return self.store.hash_object(b"", "tree")
 
+    def _require_no_staged_changes(self) -> None:
+        """Raise MiniGitError if the index differs from the tree HEAD points at.
+
+        An unborn HEAD counts as an empty tree, so anything staged before the
+        first commit is a staged change
+        """
+        head_tree = self.get_head_tree() or self._empty_tree_hash()
+        if self.tree.build_tree_from_index() != head_tree:
+            raise MiniGitError("staged changes present; commit them first")
+
+    def switch_branch(self, name) -> None:
+        """
+        Ponit HEAD at nameand restore working tree from that branch's commit
+        """
+        if not os.path.exists(self._ref_path(name)):
+            raise RefNotFoundError(name)
+        self._require_no_staged_changes()
+        commit = self.read_commit(self.read_ref(name))
+        self.tree.checkout(commit.tree)
+        self.write_head(name)
+
+    def read_commit(self, commit_hash: str) -> CommitData:
         obj_type, data = self.store.read_object(commit_hash)
         if obj_type != "commit":
             raise ObjectCorruptError(commit_hash)
@@ -259,6 +299,10 @@ class CommitManager:
 
         return visited
 
+    def is_ancestor(self, ancestor_hash: str, descendant_hash: str) -> bool:
+        """Return True if ancestor_hash is reachable from descendant_hash"""
+        return ancestor_hash in self.walk_history(descendant_hash)
+
     def create_commit(self, tree_hash, parents, author, message) -> str:
         """
         Create a new commit object, write it to the object store, and advance
@@ -283,14 +327,6 @@ class CommitManager:
             raise RefExistsError(name)
         self.write_ref(name, commit_hash)
 
-    def switch_branch(self, name) -> None:
-        """Switch to a branch"""
-        # Week 4 - also resolve ref -> commit -> tree and call self.tree.checkout(tree_hash)
-        if not os.path.exists(self._ref_path(name)):
-            raise RefNotFoundError(name)
-        else:
-            self.write_head(name)
-
     def list_branches(self) -> list[str]:
         if not os.path.isdir(self._refs_dir()):
             return []
@@ -299,7 +335,29 @@ class CommitManager:
 
     def merge(self, branch_name) -> str | None:
         # Week 4 fast-forward / Week 5 three-way
-        return None
+        """Fast-forward the current branch to `branch_name` when history allows it
+
+        Raises RefNotFoundError for an
+        unknown branch, and MiniGitError when the two histories have diverged.
+        """
+        if not os.path.exists(self._ref_path(branch_name)):
+            raise RefNotFoundError(branch_name)
+
+        target = self.read_ref(branch_name)
+        current = self._current_branch()
+        current_hash = self.read_ref(current)
+
+        if current_hash is not None and (
+            target == current_hash or self.is_ancestor(target, current_hash)
+        ):
+            return None
+        if current_hash is None or self.is_ancestor(current_hash, target):
+            self._require_no_staged_changes()
+            self.tree.checkout(self.read_commit(target).tree)
+            self.write_ref(current, target)
+            return None
+
+        raise MiniGitError("three-way merge is not implemented yet")
 
     def log(self) -> list[str]:
         """Return one summary line per commit reachable from HEAD, newest first"""

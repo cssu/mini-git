@@ -1,5 +1,6 @@
 """Object tests: Tests for module 1 - object storage."""
 
+import zlib
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,109 @@ def test_round_trip(tmp_path: Path) -> None:
     store = ObjectStore(tmp_path)
     obj_hash = store.write_object(b"hi", "blob")
     assert store.read_object(obj_hash) == ("blob", b"hi")
+
+
+@pytest.mark.parametrize(
+    ("data", "obj_type"),
+    [
+        (b"", "blob"),
+        (b"\x00\xff", "blob"),
+        ("café".encode(), "blob"),
+        (b"", "tree"),
+        (b"message", "commit"),
+    ],
+)
+def test_round_trip_with_fresh_store(tmp_path: Path, data: bytes, obj_type: str) -> None:
+    """Round-trip empty, binary, Unicode, tree, and commit data via a new store."""
+    first_store = ObjectStore(tmp_path)
+    obj_hash = first_store.write_object(data, obj_type)
+
+    second_store = ObjectStore(tmp_path)
+
+    assert second_store.read_object(obj_hash) == (obj_type, data)
+
+
+@pytest.mark.parametrize("invalid_hash", ["", "a" * 39, "A" * 40, "g" * 40, "a" * 41])
+def test_invalid_hash_is_not_found(tmp_path: Path, invalid_hash: str) -> None:
+    """Reject hashes that are not exactly 40 lowercase hexadecimal characters."""
+    with pytest.raises(ObjectNotFoundError):
+        ObjectStore(tmp_path).read_object(invalid_hash)
+
+
+@pytest.mark.parametrize(
+    "raw_object",
+    [
+        b"unknown 0\0",
+        b"blob nope\0",
+        b"blob 2\0x",
+        b"blob 1\0xy",
+        b"blob 1",
+    ],
+)
+def test_malformed_object_is_corrupt(tmp_path: Path, raw_object: bytes) -> None:
+    """Reject malformed headers, unknown types, and incorrect byte lengths."""
+    store = ObjectStore(tmp_path)
+    obj_hash = "a" * 40
+    object_path = store._object_path(obj_hash)
+    object_path.parent.mkdir(parents=True)
+    object_path.write_bytes(zlib.compress(raw_object))
+
+    with pytest.raises(ObjectCorruptError):
+        store.read_object(obj_hash)
+
+
+def test_trailing_compressed_data_is_corrupt(tmp_path: Path) -> None:
+    """Reject compressed streams with trailing data after the object stream."""
+    store = ObjectStore(tmp_path)
+    obj_hash = store.hash_object(b"x", "blob")
+    object_path = store._object_path(obj_hash)
+    object_path.parent.mkdir(parents=True)
+    object_path.write_bytes(zlib.compress(b"blob 1\0x") + b"trailing")
+
+    with pytest.raises(ObjectCorruptError):
+        store.read_object(obj_hash)
+
+
+def test_duplicate_corrupt_object_raises(tmp_path: Path) -> None:
+    """Validate an existing duplicate and raise when its bytes are corrupt."""
+    store = ObjectStore(tmp_path)
+    obj_hash = store.write_object(b"hi", "blob")
+    store._object_path(obj_hash).write_bytes(b"corrupt")
+
+    with pytest.raises(ObjectCorruptError):
+        store.write_object(b"hi", "blob")
+
+
+def test_failed_write_cleans_up_and_can_retry(tmp_path: Path, monkeypatch) -> None:
+    """Remove a failed temporary write and allow the object to be retried."""
+    store = ObjectStore(tmp_path)
+
+    def fail_replace(source, destination):
+        raise OSError("simulated failure")
+
+    monkeypatch.setattr("minigit.objects.os.replace", fail_replace)
+    with pytest.raises(OSError):
+        store.write_object(b"retry", "blob")
+
+    obj_hash = store.hash_object(b"retry", "blob")
+    assert not store._object_path(obj_hash).exists()
+    assert list(store.objects_dir.rglob("*")) == [store._object_path(obj_hash).parent]
+
+    monkeypatch.undo()
+    assert store.write_object(b"retry", "blob") == obj_hash
+
+
+def test_has_object_distinguishes_missing_valid_and_corrupt(tmp_path: Path) -> None:
+    """Return false only for missing objects and propagate corruption errors."""
+    store = ObjectStore(tmp_path)
+    obj_hash = store.write_object(b"valid", "blob")
+
+    assert store.has_object(obj_hash)
+    assert not store.has_object("a" * 40)
+
+    store._object_path(obj_hash).write_bytes(b"corrupt")
+    with pytest.raises(ObjectCorruptError):
+        store.has_object(obj_hash)
 
 
 def test_identical_objects_same_hash(tmp_path: Path):
@@ -283,3 +387,11 @@ def test_tree_round_trip_preserves_non_delimiter_characters(tmp_path, name):
 def test_tree_rejects_null_in_filename(tmp_path):
     with pytest.raises(ValueError):
         ObjectStore(tmp_path).write_tree([TreeEntry("100644", "blob", "a" * 40, "bad\0name")])
+
+
+@pytest.mark.parametrize("obj_type", ["unknown", "blob\ncommit", ""])
+def test_write_rejects_unsupported_type_without_creating_objects(tmp_path, obj_type):
+    store = ObjectStore(tmp_path)
+    with pytest.raises(ValueError, match="unsupported object type"):
+        store.write_object(b"data", obj_type)
+    assert not store.objects_dir.exists()

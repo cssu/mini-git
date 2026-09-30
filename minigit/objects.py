@@ -53,6 +53,8 @@ class ObjectStore:
         Existing objects are validated before duplicate writes return. A
         corrupt existing object raises ObjectCorruptError.
         """
+        if obj_type not in self._OBJECT_TYPES:
+            raise ValueError(f"unsupported object type: {obj_type}")
         obj_hash = self.hash_object(data, obj_type)
         object_path = self._object_path(obj_hash)
 

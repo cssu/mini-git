@@ -387,3 +387,11 @@ def test_tree_round_trip_preserves_non_delimiter_characters(tmp_path, name):
 def test_tree_rejects_null_in_filename(tmp_path):
     with pytest.raises(ValueError):
         ObjectStore(tmp_path).write_tree([TreeEntry("100644", "blob", "a" * 40, "bad\0name")])
+
+
+@pytest.mark.parametrize("obj_type", ["unknown", "blob\ncommit", ""])
+def test_write_rejects_unsupported_type_without_creating_objects(tmp_path, obj_type):
+    store = ObjectStore(tmp_path)
+    with pytest.raises(ValueError, match="unsupported object type"):
+        store.write_object(b"data", obj_type)
+    assert not store.objects_dir.exists()

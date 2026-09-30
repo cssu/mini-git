@@ -13,7 +13,7 @@ import os
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from minigit.errors import MiniGitError
+from minigit.errors import MiniGitError, ObjectCorruptError
 
 
 class IndexEntry(NamedTuple):
@@ -199,7 +199,9 @@ class WorkingTree:
         blob_cache = {}
         for entry in target_entries:
             self._validate_checkout_path(entry.path)
-            _, data = self.store.read_object(entry.hash)
+            obj_type, data = self.store.read_object(entry.hash)
+            if obj_type != "blob":
+                raise ObjectCorruptError(entry.hash)
             blob_cache[entry.path] = data
 
         current_entries = self.read_index()
@@ -207,21 +209,47 @@ class WorkingTree:
 
         # Refuse if any tracked file has local edits or is missing.
         for entry in current_entries:
+            self._validate_checkout_path(entry.path)
             full_path = os.path.join(self.root, entry.path)
             if not os.path.isfile(full_path):
                 raise MiniGitError(f"local changes would be lost: {entry.path} is missing")
             with open(full_path, "rb") as f:
                 data = f.read()
-            disk_hash = self.store.write_object(data, "blob")
+            disk_hash = self.store.hash_object(data, "blob")
             disk_mode = "100755" if os.access(full_path, os.X_OK) else "100644"
             if disk_hash != entry.hash or disk_mode != entry.mode:
                 raise MiniGitError(f"local changes would be lost: {entry.path}")
 
-        # Refuse if an untracked file/directory sits where the target
-        # needs to write.
+        # Preflight every parent and destination before deleting any tracked file.
+        # Directories may become files only when all their contents are tracked.
+        removable = set(current_by_path) - set(target_by_path)
+        tracked_dirs = set()
+        for path in removable:
+            parent = os.path.dirname(path)
+            while parent:
+                tracked_dirs.add(parent)
+                parent = os.path.dirname(parent)
+
         for entry in target_entries:
+            parts = entry.path.split("/")
+            for i in range(1, len(parts)):
+                parent = "/".join(parts[:i])
+                full_parent = os.path.join(self.root, parent)
+                if os.path.lexists(full_parent) and not os.path.isdir(full_parent):
+                    if parent not in removable:
+                        raise MiniGitError(f"untracked path would be overwritten: {parent}")
+
             full_path = os.path.join(self.root, entry.path)
-            if entry.path not in current_by_path and os.path.exists(full_path):
+            if os.path.isdir(full_path):
+                if entry.path not in tracked_dirs:
+                    raise MiniGitError(f"untracked path would be overwritten: {entry.path}")
+                for directory, dirnames, filenames in os.walk(full_path):
+                    for name in dirnames + filenames:
+                        child = os.path.join(directory, name)
+                        relative = os.path.relpath(child, self.root).replace(os.sep, "/")
+                        if os.path.islink(child) or relative not in removable | tracked_dirs:
+                            raise MiniGitError(f"untracked path would be overwritten: {relative}")
+            elif os.path.lexists(full_path) and entry.path not in current_by_path:
                 raise MiniGitError(f"untracked path would be overwritten: {entry.path}")
 
         # Remove tracked files the target doesn't have, then prune
@@ -244,14 +272,18 @@ class WorkingTree:
         self.write_index(target_entries)
 
     def _validate_checkout_path(self, path: str) -> None:
-        if path.startswith("/") or ".." in path.split("/"):
+        if (
+            os.path.isabs(path)
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+            or any(char in path for char in "\\\0\r\n")
+        ):
             raise MiniGitError(f"unsafe path: {path}")
         if any(part == ".minigit" for part in path.split("/")):
             raise MiniGitError(f"path under .minigit: {path}")
 
         parts = path.split("/")
         current = self.root
-        for part in parts[:-1]:
+        for part in parts:
             current = os.path.join(current, part)
             if os.path.islink(current):
                 raise MiniGitError(f"path passes through symlink: {path}")
@@ -259,7 +291,7 @@ class WorkingTree:
     def _prune_empty_dirs(self, dir_path: str) -> None:
         root = os.path.realpath(self.root)
         current = os.path.realpath(dir_path)
-        while current != root and current.startswith(root):
+        while current != root and os.path.commonpath([root, current]) == root:
             if not os.path.isdir(current) or os.listdir(current):
                 break
             os.rmdir(current)

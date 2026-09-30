@@ -41,6 +41,39 @@ and find the virtual environment themselves, so activating it is optional.
 | `scripts/build.sh` | Builds an installable package into `dist/`. |
 | `scripts/install-git-hooks.sh` | Points Git at the hooks in `githooks/`. `init.sh` already does this. |
 
+## Current workflow
+
+After setup, try this in a separate scratch directory with `minigit` on your PATH:
+
+```bash
+minigit init
+printf 'A\n' > file.txt
+minigit add file.txt
+minigit commit -m "A"
+minigit branch feature
+minigit checkout feature
+printf 'B\n' > file.txt
+minigit add file.txt
+minigit commit -m "B"
+minigit checkout main     # file.txt contains A
+minigit merge feature     # fast-forward; file.txt contains B
+minigit status            # clean
+```
+
+Checkout restores files, executable modes, and the index. It rejects staged or
+unstaged changes and untracked paths that would be overwritten. Fast-forward
+merges keep HEAD on the current branch and create no additional commit.
+Diverged branches report that three-way merging is not implemented yet.
+
+To test push, initialize another scratch repository and run
+`minigit serve --port 9418 --token demo-token` there. From the first repository,
+run `minigit push 127.0.0.1:9418 main --token demo-token`. Push transfers missing
+objects and advances the remote branch only after validating its history; it
+does not check out files or update the server's HEAD or index. Repeating the push
+reports that the branch is up to date. Use a disposable token for this local demo.
+Pull remains a handshake placeholder; fetching and restoring a branch through
+`minigit pull` is not implemented yet.
+
 ## Layout
 
 ```

@@ -220,7 +220,7 @@ class CommitManager:
 
     def switch_branch(self, name) -> None:
         """
-        Ponit HEAD at nameand restore working tree from that branch's commit
+        Point HEAD at name and restore the working tree from that branch's commit
         """
         if not os.path.exists(self._ref_path(name)):
             raise RefNotFoundError(name)

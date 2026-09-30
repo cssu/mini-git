@@ -595,10 +595,9 @@ def test_merge_failed_checkout_leaves_refs_unchanged(tmp_path):
     assert m.read_head() == "main"
 
 
-# testing against the real working tree (needs M2 checkout, issue #23)
+# testing against the real working tree
 
 
-@pytest.mark.xfail(reason="needs #23: WorkingTree.checkout is still a stub", strict=False)
 def test_switch_between_real_snapshots(tmp_path):
     """Switching between two committed snapshots restores files, index, and HEAD."""
     m = make_real_manager(tmp_path)
@@ -615,7 +614,6 @@ def test_switch_between_real_snapshots(tmp_path):
     assert m.read_ref("feature") == b
 
 
-@pytest.mark.xfail(reason="needs #23: WorkingTree.checkout is still a stub", strict=False)
 def test_real_fast_forward_restores_target_files(tmp_path):
     """The team checkpoint: a fast-forward brings the files and both refs to B."""
     m = make_real_manager(tmp_path)

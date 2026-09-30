@@ -10,6 +10,8 @@ Build the `ObjectStore` class here, per the interface contract.
 """
 
 import hashlib
+import os
+import tempfile
 import zlib
 from pathlib import Path
 from typing import NamedTuple
@@ -25,6 +27,8 @@ class TreeEntry(NamedTuple):
 
 
 class ObjectStore:
+    _OBJECT_TYPES = {"blob", "tree", "commit"}
+
     root: Path
     objects_dir: Path
 
@@ -44,40 +48,75 @@ class ObjectStore:
 
     def write_object(self, data: bytes, obj_type: str) -> str:
         """
-        Write the object to the object store and return its hash.
-        Allow duplicates to be written.
+        Write a compressed object atomically and return its SHA-1 hash.
+
+        Existing objects are validated before duplicate writes return. A
+        corrupt existing object raises ObjectCorruptError.
         """
+        if obj_type not in self._OBJECT_TYPES:
+            raise ValueError(f"unsupported object type: {obj_type}")
         obj_hash = self.hash_object(data, obj_type)
         object_path = self._object_path(obj_hash)
 
         if object_path.exists():
+            self.read_object(obj_hash)
             return obj_hash
 
         header = f"{obj_type} {len(data)}".encode()
         object_path.parent.mkdir(parents=True, exist_ok=True)
-        object_path.write_bytes(zlib.compress(header + b"\0" + data))
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=object_path.parent, prefix=f".{object_path.name}.", delete=False
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(zlib.compress(header + b"\0" + data))
+                temporary_file.flush()
+            os.replace(temporary_path, object_path)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
         return obj_hash
 
     def read_object(self, hash: str) -> tuple[str, bytes]:
         """
-        Reads the object from the object store and returns a tuple of (type, data).
-        Raise ObjectNotFoundError(hash) if the object is not found.
-        Raise ObjectCorruptError(hash) if the object is corrupt.
+        Read and validate an object, returning a tuple of (type, data).
+
+        Hashes must be full lowercase SHA-1 values. Raise
+        ObjectNotFoundError for invalid or missing hashes and
+        ObjectCorruptError for invalid compressed data, headers, lengths,
+        types, or content hashes.
         """
+        if len(hash) != 40 or any(character not in "0123456789abcdef" for character in hash):
+            raise ObjectNotFoundError(hash)
+
         object_path = self._object_path(hash)
 
         if not object_path.exists():
             raise ObjectNotFoundError(hash)
 
         try:
-            raw_object = zlib.decompress(object_path.read_bytes())
-            header, content = raw_object.split(b"\0", 1)
-            obj_type, obj_length = header.decode().split(" ", 1)
-
-            if int(obj_length) != len(content):
+            compressed_object = object_path.read_bytes()
+            decompressor = zlib.decompressobj()
+            raw_object = decompressor.decompress(compressed_object) + decompressor.flush()
+            if not decompressor.eof or decompressor.unused_data or decompressor.unconsumed_tail:
+                raise ObjectCorruptError(hash)
+            header, separator, content = raw_object.partition(b"\0")
+            if not separator:
                 raise ObjectCorruptError(hash)
 
-        except (ValueError, UnicodeDecodeError, zlib.error) as error:
+            header_fields = header.split(b" ")
+            if len(header_fields) != 2:
+                raise ObjectCorruptError(hash)
+            obj_type_bytes, obj_length_bytes = header_fields
+            obj_type = obj_type_bytes.decode("ascii")
+            if obj_type not in self._OBJECT_TYPES or not obj_length_bytes.isdigit():
+                raise ObjectCorruptError(hash)
+            if int(obj_length_bytes) != len(content):
+                raise ObjectCorruptError(hash)
+
+        except (OSError, UnicodeDecodeError, ValueError, zlib.error) as error:
             raise ObjectCorruptError(hash) from error
 
         if self.hash_object(content, obj_type) != hash:
@@ -87,9 +126,22 @@ class ObjectStore:
 
     def _object_path(self, hash: str) -> Path:
         """
-        Return the path to the object with the given hash.
+        Return the loose-object path for a validated lowercase SHA-1 hash.
+
+        Raise ObjectNotFoundError before constructing a path for invalid
+        hashes.
         """
+        if len(hash) != 40 or any(character not in "0123456789abcdef" for character in hash):
+            raise ObjectNotFoundError(hash)
         return self.objects_dir / hash[:2] / hash[2:]
+
+    def has_object(self, hash: str) -> bool:
+        """Return whether a valid object exists, propagating corruption errors."""
+        try:
+            self.read_object(hash)
+        except ObjectNotFoundError:
+            return False
+        return True
 
     @staticmethod
     def _validate_tree_entry(entry: TreeEntry) -> None:

@@ -689,3 +689,48 @@ def test_server_survives_corrupt_objects_and_invalid_requests(remote_server):
         assert receive_line(sock, buf) == "OBJ blob 4"
         assert recv_exact(sock, buf, 4) == b"good"
         send_line(sock, "DONE")
+
+
+@pytest.mark.parametrize("command", ["HAVE", "PUT"])
+def test_push_corrupt_existing_object_does_not_stop_server(push_pair, command):
+    pair = push_pair
+    tip = _commit(pair.local_store, pair.local_commits, {"a.txt": b"one"}, [])
+    blob = pair.remote_store.write_object(b"one", "blob")
+    pair.remote_store._object_path(blob).write_bytes(b"corrupt")
+    with socket.create_connection(("127.0.0.1", pair.server.port), timeout=2) as sock:
+        buf = bytearray()
+        send_line(sock, "AUTH tok")
+        assert receive_line(sock, buf) == "OK"
+        send_line(sock, f"PUSH main - {tip}")
+        assert receive_line(sock, buf) == "OK"
+        send_line(sock, f"{command} {blob}")
+        if command == "PUT":
+            send_line(sock, "OBJ blob 3")
+            sock.sendall(b"one")
+        assert receive_line(sock, buf).startswith("ERR")
+    assert pair.remote_commits.read_ref("main") is None
+    with socket.create_connection(("127.0.0.1", pair.server.port), timeout=2) as sock:
+        buf = bytearray()
+        send_line(sock, "AUTH tok")
+        assert receive_line(sock, buf) == "OK"
+        send_line(sock, "REF main")
+        assert receive_line(sock, buf) == "REF main -"
+        send_line(sock, "DONE")
+
+
+@pytest.mark.parametrize("reply", ["ERR", "ERR invalid branch", "REF other -", "REF main bad"])
+def test_push_invalid_ref_reply_is_protocol_error(tmp_path, monkeypatch, reply):
+    manager = CommitManager(tmp_path)
+    _commit(manager.store, manager, {"a.txt": b"one"}, [])
+
+    class ReplySocket(FakeReceiveSocket):
+        def sendall(self, data):
+            pass
+
+        def close(self):
+            pass
+
+    sock = ReplySocket(f"OK\n{reply}\n".encode())
+    monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: sock)
+    with pytest.raises(NetworkProtocolError, match="invalid"):
+        RemoteClient(tmp_path).push("localhost:9418", "main", "tok")

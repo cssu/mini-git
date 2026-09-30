@@ -161,7 +161,14 @@ class RemoteClient:
 
             send_line(sock, f"REF {branch}")
             reply = receive_line(sock, buf)
-            remote_hash = reply.rsplit(" ", 1)[1]
+            fields = reply.split(" ")
+            if len(fields) != 3 or fields[:2] != ["REF", branch]:
+                raise NetworkProtocolError(f"invalid REF response: {reply!r}")
+            remote_hash = fields[2]
+            if remote_hash != "-" and (
+                len(remote_hash) != 40 or any(c not in "0123456789abcdef" for c in remote_hash)
+            ):
+                raise NetworkProtocolError(f"invalid remote hash: {remote_hash!r}")
 
             if remote_hash == local_hash:
                 print(f"{branch} is up to date")
@@ -371,6 +378,11 @@ class RemoteServer:
 
             try:
                 self._handle_client(conn)
+            except (ObjectNotFoundError, ObjectCorruptError) as exc:
+                try:
+                    send_line(conn, f"ERR object validation failed: {exc}")
+                except OSError:
+                    pass
             except (NetworkProtocolError, OSError):
                 pass  # a bad client must not take down the server
             finally:

@@ -49,7 +49,12 @@ def test_checkout_rejects_leaf_symlink(tmp_path, dangling):
     old = wt.store.write_object(b"original", "blob")
     if not dangling:
         wt.write_index([IndexEntry("100644", old, "link")])
-    (root / "link").symlink_to(outside)
+    try:
+        (root / "link").symlink_to(outside)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is unavailable")
+        raise
     with pytest.raises(MiniGitError):
         wt.checkout(target_tree(wt, "link"))
     assert (root / "link").is_symlink()

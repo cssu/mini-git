@@ -10,6 +10,7 @@ Build the `WorkingTree` class here, per the interface contract.
 """
 
 import os
+import stat
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -40,6 +41,14 @@ class WorkingTree:
             store = ObjectStore(repo_path)
 
         self.store = store
+
+    @staticmethod
+    def _file_mode(path: str) -> str:
+        if os.stat(path).st_mode & stat.S_IXUSR:
+            return "100755"
+        if os.name == "nt" and os.path.splitext(path)[1].lower() in {".bat", ".cmd", ".exe", ".sh"}:
+            return "100755"
+        return "100644"
 
     def read_index(self) -> list[IndexEntry]:
         if not os.path.exists(self.index_path):
@@ -81,10 +90,7 @@ class WorkingTree:
 
         blob_hash = self.store.write_object(data, "blob")
 
-        if os.access(full_path, os.X_OK):
-            mode = "100755"
-        else:
-            mode = "100644"
+        mode = self._file_mode(full_path)
 
         entries = [e for e in self.read_index() if e.path != rel_path]
         entries.append(IndexEntry(mode, blob_hash, rel_path))
@@ -147,7 +153,7 @@ class WorkingTree:
                 with open(full_path, "rb") as f:
                     data = f.read()
                 current_hash = self.store.hash_object(data, "blob")
-                current_mode = "100755" if os.access(full_path, os.X_OK) else "100644"
+                current_mode = self._file_mode(full_path)
                 if current_hash != entry.hash or current_mode != entry.mode:
                     result.modified.append(entry.path)
 
@@ -177,7 +183,7 @@ class WorkingTree:
                 with open(full_path, "rb") as f:
                     data = f.read()
                 current_hash = self.store.hash_object(data, "blob")
-                current_mode = "100755" if os.access(full_path, os.X_OK) else "100644"
+                current_mode = self._file_mode(full_path)
                 if current_hash != entry.hash or current_mode != entry.mode:
                     result.modified.append(entry.path)
 
@@ -216,7 +222,7 @@ class WorkingTree:
             with open(full_path, "rb") as f:
                 data = f.read()
             disk_hash = self.store.hash_object(data, "blob")
-            disk_mode = "100755" if os.access(full_path, os.X_OK) else "100644"
+            disk_mode = self._file_mode(full_path)
             if disk_hash != entry.hash or disk_mode != entry.mode:
                 raise MiniGitError(f"local changes would be lost: {entry.path}")
 
@@ -335,7 +341,7 @@ def cmd_status(args) -> int:
             with open(full_path, "rb") as f:
                 data = f.read()
             current_hash = wt.store.hash_object(data, "blob")
-            current_mode = "100755" if os.access(full_path, os.X_OK) else "100644"
+            current_mode = wt._file_mode(full_path)
             if current_hash != entry.hash or current_mode != entry.mode:
                 not_staged_paths.add(entry.path)
 

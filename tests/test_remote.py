@@ -9,7 +9,13 @@ import pytest
 
 from minigit.cli import main
 from minigit.commits import CommitManager
-from minigit.errors import NetworkProtocolError
+from minigit.errors import (
+    MergeConflictError,
+    MiniGitError,
+    NetworkProtocolError,
+    ObjectCorruptError,
+    ObjectNotFoundError,
+)
 from minigit.objects import ObjectStore
 from minigit.objects import TreeEntry as RealTreeEntry
 from minigit.remote import RemoteClient, RemoteServer, receive_line, recv_exact, send_line
@@ -1019,3 +1025,440 @@ def test_cli_push_rejection_shows_reason(push_pair, monkeypatch, capsys):
     assert "push rejected" in err
     assert "pull first" in err
     assert "tok" not in err
+
+
+# --- fetch / pull / multi-ref (#41) ---
+
+
+def _commit_on(
+    commits: CommitManager, branch: str, files: dict, parents: list, message: str
+) -> str:
+    """Write a commit with fixed metadata straight onto `branch`, without touching HEAD."""
+
+    tree = _write_tree(commits.store, files)
+    lines = [f"tree {tree}", *(f"parent {p}" for p in parents)]
+    lines += ["author tester <t@example.com> 0", "committer tester <t@example.com> 0", "", message]
+    commit_hash = commits.store.write_object("\n".join(lines).encode(), "commit")
+    commits.write_ref(branch, commit_hash)
+    return commit_hash
+
+
+class FakeIntegratingCommitManager(CommitManager):
+    """Stands in for M3's #40 `integrate_fetched` until the real one lands.
+
+    Follows #40's spec: the checked-out branch is checked out + advanced on
+    a fast-forward, merged (here: a two-parent commit reusing the fetched
+    tree) on divergence, or raises `MergeConflictError` when told to; other
+    branches are created or fast-forwarded by ref only, and rejected when
+    diverged. Records each call and whether the fetched history was
+    complete at that moment.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.calls: list[tuple[str, str, bool]] = []
+        self.conflict_paths: list[str] = []
+
+    def _history_complete(self, tip: str) -> bool:
+        try:
+            for commit_hash in self.walk_history(tip):
+                self.tree.read_tree_entries(self.read_commit(commit_hash).tree)
+            return True
+        except (ObjectNotFoundError, ObjectCorruptError):
+            return False
+
+    def integrate_fetched(self, branch: str, fetched_hash: str) -> str | None:
+        self.calls.append((branch, fetched_hash, self._history_complete(fetched_hash)))
+        local = self.read_ref(branch)
+        if local == fetched_hash or (local and self.is_ancestor(fetched_hash, local)):
+            return None
+        fast_forward = local is None or self.is_ancestor(local, fetched_hash)
+
+        if branch != self._current_branch():
+            if not fast_forward:
+                raise MiniGitError(f"{branch} diverged; check it out and pull again")
+            self.write_ref(branch, fetched_hash)
+            return None
+
+        if fast_forward:
+            self.tree.checkout(self.read_commit(fetched_hash).tree)
+            self.write_ref(branch, fetched_hash)
+            return None
+        if self.conflict_paths:
+            raise MergeConflictError(self.conflict_paths)
+        tree = self.read_commit(fetched_hash).tree
+        return self.create_commit(tree, [local, fetched_hash], "tester <t@example.com>", "merge")
+
+
+@dataclass
+class PullPair:
+    client: RemoteClient
+    local: FakeIntegratingCommitManager
+    remote: CommitManager
+    address: str
+    local_root: Path
+
+
+@pytest.fixture
+def pull_pair(tmp_path, push_pair):
+    """`push_pair`'s server, plus a fresh local repo whose M3 has `integrate_fetched`."""
+
+    root = tmp_path / "puller"
+    root.mkdir()
+    store = ObjectStore(str(root))
+    local = FakeIntegratingCommitManager(str(root), store=store)
+    client = RemoteClient(repo_path=str(root), store=store, commits=local)
+    return PullPair(client, local, push_pair.remote_commits, push_pair.address, root)
+
+
+def _count_receives(monkeypatch) -> list:
+    """Record every object payload `RemoteClient` receives, while still receiving it."""
+
+    calls = []
+    original = RemoteClient._receive_object
+
+    def counting(self, sock, buf, expected_hash, expected_type=None):
+        calls.append(expected_hash)
+        return original(self, sock, buf, expected_hash, expected_type)
+
+    monkeypatch.setattr(RemoteClient, "_receive_object", counting)
+    return calls
+
+
+def _scripted_client(monkeypatch, tmp_path, script: bytes) -> RemoteClient:
+    """A real client whose socket replays `script` as the server's side of the session."""
+
+    class ScriptedSocket(FakeReceiveSocket):
+        def sendall(self, data):
+            pass
+
+        def close(self):
+            pass
+
+    sock = ScriptedSocket(script)
+    monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: sock)
+    return RemoteClient(tmp_path)
+
+
+def _merge_history(remote: CommitManager) -> tuple[str, str, str]:
+    """base <- left <- merge(left, base): a merge whose second parent is the common ancestor."""
+
+    files = {"a.txt": b"base\n", "bin/data.bin": bytes(range(256)), "d/e/f.txt": b"deep\n"}
+    base = _commit_on(remote, "main", files, [], "base")
+    left = _commit_on(remote, "main", {**files, "a.txt": b"left\n"}, [base], "left")
+    merge = _commit_on(remote, "main", {**files, "a.txt": b"merged\n"}, [left, base], "merge")
+    return base, left, merge
+
+
+def test_fetch_downloads_full_history_without_touching_refs(push_pair):
+    pair = push_pair
+    base, left, merge = _merge_history(pair.remote_commits)
+
+    assert pair.client.fetch(pair.address, "main", "tok") == merge
+
+    remote_client = RemoteClient(
+        pair.server.repo_path, store=pair.remote_store, commits=pair.remote_commits
+    )
+    expected = remote_client._collect_from(merge)
+    for obj_hash in expected:
+        assert pair.local_store.read_object(obj_hash) == pair.remote_store.read_object(obj_hash)
+    assert set(pair.local_commits.walk_history(merge)) == {base, left, merge}
+    assert pair.local_commits.read_ref("main") is None
+    assert not (Path(pair.client.repo_path) / ".minigit" / "HEAD").exists()
+
+
+def test_repeat_fetch_receives_no_objects(push_pair, monkeypatch):
+    pair = push_pair
+    _merge_history(pair.remote_commits)
+    pair.client.fetch(pair.address, "main", "tok")
+
+    received = _count_receives(monkeypatch)
+    pair.client.fetch(pair.address, "main", "tok")
+    assert received == []
+
+
+def test_fetch_requests_missing_tree_under_present_commit(push_pair, monkeypatch):
+    """An interrupted fetch can leave a commit stored without its tree."""
+
+    pair = push_pair
+    tip = _commit_on(pair.remote_commits, "main", {"a.txt": b"1"}, [], "c")
+    obj_type, content = pair.remote_store.read_object(tip)
+    pair.local_store.write_object(content, obj_type)  # commit present, tree + blob missing
+
+    received = _count_receives(monkeypatch)
+    pair.client.fetch(pair.address, "main", "tok")
+    tree = pair.remote_commits.read_commit(tip).tree
+    assert tip not in received
+    assert tree in received
+    assert len(received) == 2
+
+
+def test_fetch_shared_objects_across_branches_transfer_once(push_pair, monkeypatch):
+    pair = push_pair
+    shared = {"shared.bin": b"\x00" * 1000, "lib/util.txt": b"util\n"}
+    _commit_on(pair.remote_commits, "main", {**shared, "m.txt": b"m"}, [], "m")
+    _commit_on(pair.remote_commits, "feature", {**shared, "f.txt": b"f"}, [], "f")
+
+    received = _count_receives(monkeypatch)
+    pair.client.fetch(pair.address, "main", "tok")
+    pair.client.fetch(pair.address, "feature", "tok")
+    assert len(received) == len(set(received))
+    assert pair.local_store.hash_object(b"\x00" * 1000, "blob") in received
+
+
+def test_fetch_missing_branch_raises(push_pair):
+    with pytest.raises(NetworkProtocolError, match="no branch 'nope'"):
+        push_pair.client.fetch(push_pair.address, "nope", "tok")
+
+
+@pytest.mark.parametrize("branch", ["../escape", "a b", "", "x/../y"])
+def test_fetch_invalid_branch_name_raises(push_pair, branch):
+    with pytest.raises(NetworkProtocolError, match="invalid branch"):
+        push_pair.client.fetch(push_pair.address, branch, "tok")
+
+
+def test_bad_token_is_rejected_and_never_echoed(push_pair):
+    _commit_on(push_pair.remote_commits, "main", {"a.txt": b"1"}, [], "c")
+    for call in (
+        lambda: push_pair.client.fetch(push_pair.address, "main", "s3cret-xyz"),
+        lambda: push_pair.client.list_refs(push_pair.address, "s3cret-xyz"),
+    ):
+        with pytest.raises(NetworkProtocolError, match="authentication failed") as info:
+            call()
+        assert "s3cret" not in str(info.value)
+
+
+def test_command_before_auth_is_refused_and_server_survives(push_pair):
+    pair = push_pair
+    for first_line in ["REF main", "REFS", f"WANT {'a' * 40}"]:
+        with socket.create_connection(("127.0.0.1", pair.server.port), timeout=2) as sock:
+            buf = bytearray()
+            send_line(sock, first_line)
+            assert receive_line(sock, buf) == "ERR bad auth"
+    assert pair.client.list_refs(pair.address, "tok") == {}
+
+
+def _blob_hash(data: bytes) -> str:
+    return hashlib.sha1(f"blob {len(data)}".encode() + b"\0" + data).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "reply, message",
+    [
+        (b"OBJ blob 1\nx", "is a blob, expected a commit"),
+        (b"OBJ commit 3\nabc", "failed hash verification"),
+        (b"OBJ commit 50\nabc", "connection closed"),
+        (b"ERR unknown object\n", "could not provide"),
+        (b"garbage\n", "expected OBJ"),
+    ],
+)
+def test_fetch_bad_object_replies_raise(monkeypatch, tmp_path, reply, message):
+    tip = _blob_hash(b"x")  # a valid hash the scripted server lies about
+    script = b"OK\nREF main " + tip.encode() + b"\n" + reply
+    client = _scripted_client(monkeypatch, tmp_path, script)
+    with pytest.raises(NetworkProtocolError, match=message):
+        client.fetch("localhost:9418", "main", "tok")
+    assert not client.store.has_object(tip)
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        b"OK\nREF main zzz\nEND\n",
+        b"OK\nREF ../x " + b"a" * 40 + b"\nEND\n",
+        b"OK\nREF main " + b"a" * 40 + b"\nREF main " + b"b" * 40 + b"\nEND\n",
+        b"OK\nERR expected REF, WANT, PUSH, or DONE\n",
+        b"OK\nREF main " + b"a" * 40 + b"\n",  # no END before the connection closes
+    ],
+)
+def test_list_refs_malformed_replies_raise(monkeypatch, tmp_path, script):
+    client = _scripted_client(monkeypatch, tmp_path, script)
+    with pytest.raises(NetworkProtocolError):
+        client.list_refs("localhost:9418", "tok")
+
+
+def test_list_refs_lists_every_branch_and_skips_non_refs(push_pair):
+    pair = push_pair
+    assert pair.client.list_refs(pair.address, "tok") == {}
+    main_tip = _commit_on(pair.remote_commits, "main", {"a.txt": b"1"}, [], "m")
+    feature_tip = _commit_on(pair.remote_commits, "feature", {"b.txt": b"2"}, [], "f")
+    (Path(pair.server.repo_path) / ".minigit" / "refs" / "heads" / "nested").mkdir()
+
+    assert pair.client.list_refs(pair.address, "tok") == {"main": main_tip, "feature": feature_tip}
+
+
+def test_interrupted_fetch_keeps_state_and_retry_completes(push_pair, monkeypatch):
+    pair = push_pair
+    _, _, merge = _merge_history(pair.remote_commits)
+    total = len(
+        RemoteClient(
+            pair.server.repo_path, store=pair.remote_store, commits=pair.remote_commits
+        )._collect_from(merge)
+    )
+
+    original = RemoteClient._receive_object
+    calls = []
+
+    def flaky(self, sock, buf, expected_hash, expected_type=None):
+        if len(calls) == 3:
+            raise NetworkProtocolError("connection dropped")
+        calls.append(expected_hash)
+        return original(self, sock, buf, expected_hash, expected_type)
+
+    monkeypatch.setattr(RemoteClient, "_receive_object", flaky)
+    with pytest.raises(NetworkProtocolError):
+        pair.client.fetch(pair.address, "main", "tok")
+    assert pair.local_commits.read_ref("main") is None
+    minigit_dir = Path(pair.client.repo_path) / ".minigit"
+    assert not (minigit_dir / "HEAD").exists() and not (minigit_dir / "index").exists()
+
+    monkeypatch.setattr(RemoteClient, "_receive_object", original)
+    received = _count_receives(monkeypatch)
+    assert pair.client.fetch(pair.address, "main", "tok") == merge
+    assert len(received) == total - 3
+
+
+def test_pull_unborn_then_fast_forward_checks_out_files(pull_pair, capsys):
+    pair = pull_pair
+    base = _commit_on(pair.remote, "main", {"a.txt": b"one\n"}, [], "base")
+    pair.client.pull(pair.address, "main", "tok")
+    assert pair.local.read_ref("main") == base
+    assert (pair.local_root / "a.txt").read_bytes() == b"one\n"
+
+    ahead = _commit_on(pair.remote, "main", {"a.txt": b"two\n"}, [base], "ahead")
+    capsys.readouterr()
+    pair.client.pull(pair.address, "main", "tok")
+    assert pair.local.read_ref("main") == ahead
+    assert (pair.local_root / "a.txt").read_bytes() == b"two\n"
+    assert f"main now at {ahead}" in capsys.readouterr().out
+    assert pair.local.calls == [("main", base, True), ("main", ahead, True)]
+
+
+def test_pull_up_to_date_and_local_ahead_change_nothing(pull_pair, capsys, monkeypatch):
+    pair = pull_pair
+    base = _commit_on(pair.remote, "main", {"a.txt": b"one\n"}, [], "base")
+    pair.client.pull(pair.address, "main", "tok")
+
+    received = _count_receives(monkeypatch)
+    capsys.readouterr()
+    pair.client.pull(pair.address, "main", "tok")
+    assert "main is up to date" in capsys.readouterr().out
+    assert received == []
+
+    local_tip = _commit_on(pair.local, "main", {"a.txt": b"local\n"}, [base], "local")
+    pair.client.pull(pair.address, "main", "tok")
+    assert pair.local.read_ref("main") == local_tip
+    assert "main is up to date" in capsys.readouterr().out
+
+
+def test_pull_diverged_reports_merge_commit(pull_pair, capsys):
+    pair = pull_pair
+    base = _commit_on(pair.remote, "main", {"a.txt": b"base\n"}, [], "base")
+    pair.client.pull(pair.address, "main", "tok")
+    local_tip = _commit_on(pair.local, "main", {"a.txt": b"base\n", "l.txt": b"l"}, [base], "l")
+    remote_tip = _commit_on(pair.remote, "main", {"a.txt": b"base\n", "r.txt": b"r"}, [base], "r")
+
+    capsys.readouterr()
+    pair.client.pull(pair.address, "main", "tok")
+    merge = pair.local.read_ref("main")
+    assert pair.local.read_commit(merge).parents == [local_tip, remote_tip]
+    assert f"main: merged {remote_tip[:7]} as {merge[:7]}" in capsys.readouterr().out
+
+
+def test_pull_conflict_propagates_paths_and_keeps_ref(pull_pair):
+    pair = pull_pair
+    base = _commit_on(pair.remote, "main", {"a.txt": b"base\n"}, [], "base")
+    pair.client.pull(pair.address, "main", "tok")
+    local_tip = _commit_on(pair.local, "main", {"a.txt": b"ours\n"}, [base], "ours")
+    _commit_on(pair.remote, "main", {"a.txt": b"theirs\n"}, [base], "theirs")
+    pair.local.conflict_paths = ["a.txt"]
+
+    with pytest.raises(MergeConflictError) as info:
+        pair.client.pull(pair.address, "main", "tok")
+    assert info.value.paths == ["a.txt"]
+    assert pair.local.read_ref("main") == local_tip
+
+
+def test_pull_never_integrates_after_failed_fetch(pull_pair):
+    pair = pull_pair
+    tip = _commit_on(pair.remote, "main", {"a.txt": b"1"}, [], "c")
+    blob = pair.remote.store.hash_object(b"1", "blob")
+    pair.remote.store._object_path(blob).write_bytes(b"corrupt")
+
+    with pytest.raises(NetworkProtocolError, match="corrupt object"):
+        pair.client.pull(pair.address, "main", "tok")
+    assert pair.local.calls == []
+    assert pair.local.read_ref("main") is None
+    assert pair.local.store.has_object(tip)  # complete objects kept for a retry
+
+
+def test_pull_without_m3_creates_and_fast_forwards_inactive_branch(push_pair):
+    pair = push_pair
+    assert not hasattr(pair.local_commits, "integrate_fetched")
+    f1 = _commit_on(pair.remote_commits, "feature", {"f.txt": b"1"}, [], "f1")
+    pair.client.pull(pair.address, "feature", "tok")
+    assert pair.local_commits.read_ref("feature") == f1
+
+    f2 = _commit_on(pair.remote_commits, "feature", {"f.txt": b"2"}, [f1], "f2")
+    pair.client.pull(pair.address, "feature", "tok")
+    assert pair.local_commits.read_ref("feature") == f2
+    assert not (Path(pair.client.repo_path) / "f.txt").exists()  # no checkout
+
+
+def test_pull_without_m3_rejects_diverged_inactive_branch(push_pair):
+    pair = push_pair
+    base = _commit_on(pair.remote_commits, "feature", {"f.txt": b"base"}, [], "base")
+    pair.client.pull(pair.address, "feature", "tok")
+    local_tip = _commit_on(pair.local_commits, "feature", {"f.txt": b"ours"}, [base], "ours")
+    _commit_on(pair.remote_commits, "feature", {"f.txt": b"theirs"}, [base], "theirs")
+
+    with pytest.raises(MiniGitError, match="check out feature and pull again"):
+        pair.client.pull(pair.address, "feature", "tok")
+    assert pair.local_commits.read_ref("feature") == local_tip
+
+
+def test_pull_without_m3_refuses_checked_out_branch(push_pair):
+    pair = push_pair
+    tip = _commit_on(pair.remote_commits, "main", {"a.txt": b"1"}, [], "c")
+
+    with pytest.raises(MiniGitError, match="#40"):
+        pair.client.pull(pair.address, "main", "tok")
+    assert pair.local_commits.read_ref("main") is None
+    assert pair.local_store.has_object(tip)
+
+
+def test_cli_ls_remote_and_push_all(push_pair, monkeypatch, capsys):
+    pair = push_pair
+    main_tip = _commit_on(pair.local_commits, "main", {"a.txt": b"1"}, [], "m")
+    feature_tip = _commit_on(pair.local_commits, "feature", {"b.txt": b"2"}, [main_tip], "f")
+    monkeypatch.chdir(pair.client.repo_path)
+
+    assert main(["push", pair.address, "--all", "--token", "tok"]) == 0
+    assert pair.remote_commits.read_ref("main") == main_tip
+    assert pair.remote_commits.read_ref("feature") == feature_tip
+
+    capsys.readouterr()
+    assert main(["ls-remote", pair.address, "--token", "tok"]) == 0
+    assert capsys.readouterr().out == f"{feature_tip}\tfeature\n{main_tip}\tmain\n"
+
+
+def test_cli_pull_all_reports_each_branch(push_pair, monkeypatch, capsys):
+    pair = push_pair
+    _commit_on(pair.remote_commits, "main", {"a.txt": b"1"}, [], "m")
+    feature_tip = _commit_on(pair.remote_commits, "feature", {"b.txt": b"2"}, [], "f")
+    monkeypatch.chdir(pair.client.repo_path)
+
+    # main is the checked-out branch, which needs M3's #40 helper; feature still lands.
+    assert main(["pull", pair.address, "--all", "--token", "tok"]) == 1
+    out, err = capsys.readouterr()
+    assert pair.local_commits.read_ref("feature") == feature_tip
+    assert f"feature now at {feature_tip}" in out
+    assert "minigit: main:" in err
+
+
+@pytest.mark.parametrize("args", [["push", "--all", "main"], ["push"], ["pull"]])
+def test_cli_branch_or_all_required(push_pair, monkeypatch, capsys, args):
+    monkeypatch.chdir(push_pair.client.repo_path)
+    command, *rest = args
+    assert main([command, push_pair.address, *rest, "--token", "tok"]) == 1
+    assert "either a branch name or --all" in capsys.readouterr().err

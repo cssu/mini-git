@@ -1,5 +1,6 @@
 """Object tests: Tests for module 1 - object storage."""
 
+import os
 import zlib
 from pathlib import Path
 
@@ -379,19 +380,136 @@ def test_tree_round_trip_with_new_store(tmp_path):
 
 @pytest.mark.parametrize("name", ["vertical\vtab", "form\ffeed", "unicode\u2028separator"])
 def test_tree_round_trip_preserves_non_delimiter_characters(tmp_path, name):
+    """Tests that writing a tree with non-delimiter characters
+    in names can be read back correctly."""
     store = ObjectStore(tmp_path)
     entries = [TreeEntry("100644", "blob", "a" * 40, name)]
     assert store.read_tree(store.write_tree(entries)) == entries
 
 
 def test_tree_rejects_null_in_filename(tmp_path):
+    """Tests that writing a tree with a null character in a filename raises a ValueError."""
     with pytest.raises(ValueError):
         ObjectStore(tmp_path).write_tree([TreeEntry("100644", "blob", "a" * 40, "bad\0name")])
 
 
+def test_pack_objects_reads_packed_only_and_deduplicates(tmp_path: Path) -> None:
+    """Tests that packing objects reads through the public API,
+    deduplicates, and preserves exact bytes."""
+    store = ObjectStore(tmp_path)
+    objects = [
+        (b"", "blob"),
+        (b"\x00binary\xff", "blob"),
+        ("café".encode(), "tree"),
+        (b"tree deadbeef", "commit"),
+    ]
+    hashes = [store.write_object(data, obj_type) for data, obj_type in objects]
+
+    pack_path, index_path = store.pack_objects([hashes[0], hashes[1], hashes[0], *hashes[2:]])
+    assert pack_path.exists()
+    assert index_path.exists()
+    for obj_hash, (data, obj_type) in zip(hashes, objects, strict=True):
+        store._object_path(obj_hash).unlink()
+        assert ObjectStore(tmp_path).read_object(obj_hash) == (obj_type, data)
+
+
+def test_pack_objects_mixes_loose_and_packed_reads(tmp_path: Path) -> None:
+    """Tests that packing objects mixes loose and packed reads correctly."""
+    store = ObjectStore(tmp_path)
+    packed_hash = store.write_object(b"packed", "blob")
+    loose_hash = store.write_object(b"loose", "blob")
+    store.pack_objects([packed_hash])
+    store._object_path(packed_hash).unlink()
+
+    assert store.read_object(packed_hash) == ("blob", b"packed")
+    assert store.read_object(loose_hash) == ("blob", b"loose")
+    assert store.has_object(packed_hash)
+
+
+def test_duplicate_write_validates_packed_only_object(tmp_path: Path) -> None:
+    store = ObjectStore(tmp_path)
+    obj_hash = store.write_object(b"packed", "blob")
+    store.pack_objects([obj_hash])
+    store._object_path(obj_hash).unlink()
+
+    assert store.write_object(b"packed", "blob") == obj_hash
+    assert not store._object_path(obj_hash).exists()
+
+
+def test_corrupt_pack_record_is_reported(tmp_path: Path) -> None:
+    """Tests that a corrupt pack record raises ObjectCorruptError when reading the object."""
+    store = ObjectStore(tmp_path)
+    obj_hash = store.write_object(b"content", "blob")
+    pack_path, _ = store.pack_objects([obj_hash])
+    store._object_path(obj_hash).unlink()
+    raw = bytearray(pack_path.read_bytes())
+    raw[-1] ^= 0xFF
+    pack_path.write_bytes(raw)
+
+    with pytest.raises(ObjectCorruptError):
+        store.read_object(obj_hash)
+
+
+def test_bad_pack_index_is_reported(tmp_path: Path) -> None:
+    """Tests that a bad pack index raises ObjectCorruptError when reading the object."""
+    store = ObjectStore(tmp_path)
+    obj_hash = store.write_object(b"content", "blob")
+    _, index_path = store.pack_objects([obj_hash])
+    store._object_path(obj_hash).unlink()
+    raw = bytearray(index_path.read_bytes())
+    raw[-1] = 0
+    index_path.write_bytes(raw)
+
+    with pytest.raises(ObjectCorruptError):
+        store.read_object(obj_hash)
+
+
+def test_pack_publication_failure_leaves_previous_objects_readable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Tests that a failure during pack publication leaves previous objects readable."""
+    store = ObjectStore(tmp_path)
+    obj_hash = store.write_object(b"content", "blob")
+
+    original_replace = os.replace
+    calls = 0
+
+    def fail_index_publish(source, destination):
+        """Helper to simulate a failure during index publication."""
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated index publication failure")
+        original_replace(source, destination)
+
+    monkeypatch.setattr("minigit.objects.os.replace", fail_index_publish)
+    with pytest.raises(OSError):
+        store.pack_objects([obj_hash])
+
+    assert store.read_object(obj_hash) == ("blob", b"content")
+
+
 @pytest.mark.parametrize("obj_type", ["unknown", "blob\ncommit", ""])
 def test_write_rejects_unsupported_type_without_creating_objects(tmp_path, obj_type):
+    """Tests that writing an object with an unsupported type
+    raises a ValueError and does not create any object files.
+    """
     store = ObjectStore(tmp_path)
     with pytest.raises(ValueError, match="unsupported object type"):
         store.write_object(b"data", obj_type)
     assert not store.objects_dir.exists()
+
+
+def test_pack_index_must_cover_every_record(tmp_path):
+    store = ObjectStore(tmp_path)
+    hashes = [store.write_object(data, "blob") for data in (b"one", b"two")]
+    _, index = store.pack_objects(hashes)
+    raw = index.read_bytes()
+    index.write_bytes(
+        store._INDEX_HEADER.pack(store._INDEX_MAGIC, store._PACK_VERSION, 1)
+        + raw[store._INDEX_HEADER.size : -store._INDEX_ENTRY.size]
+    )
+    for obj_hash in hashes:
+        store._object_path(obj_hash).unlink()
+    with pytest.raises(ObjectCorruptError):
+        ObjectStore(tmp_path).read_object(hashes[0])

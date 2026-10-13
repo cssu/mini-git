@@ -11,8 +11,11 @@ Build the `ObjectStore` class here, per the interface contract.
 
 import hashlib
 import os
+import struct
 import tempfile
+import uuid
 import zlib
+from collections.abc import Iterable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -28,6 +31,13 @@ class TreeEntry(NamedTuple):
 
 class ObjectStore:
     _OBJECT_TYPES = {"blob", "tree", "commit"}
+    _PACK_MAGIC = b"MGPK"
+    _INDEX_MAGIC = b"MGIX"
+    _PACK_VERSION = 1
+    _PACK_HEADER = struct.Struct(">4sII")
+    _RECORD_HEADER = struct.Struct(">BQQ")
+    _INDEX_HEADER = struct.Struct(">4sII")
+    _INDEX_ENTRY = struct.Struct(">20sQQ")
 
     root: Path
     objects_dir: Path
@@ -38,6 +48,7 @@ class ObjectStore:
         """
         self.root = Path(repo_path)
         self.objects_dir = self.root / ".minigit" / "objects"
+        self.pack_dir = self.objects_dir / "pack"
 
     def hash_object(self, data: bytes, obj_type: str) -> str:
         """
@@ -60,6 +71,12 @@ class ObjectStore:
 
         if object_path.exists():
             self.read_object(obj_hash)
+            return obj_hash
+        try:
+            self.read_object(obj_hash)
+        except ObjectNotFoundError:
+            pass
+        else:
             return obj_hash
 
         header = f"{obj_type} {len(data)}".encode()
@@ -87,41 +104,227 @@ class ObjectStore:
         ObjectNotFoundError for invalid or missing hashes and
         ObjectCorruptError for invalid compressed data, headers, lengths,
         types, or content hashes.
+        Perform a loose-first lookup, then a packed lookup, validating every object
         """
         if len(hash) != 40 or any(character not in "0123456789abcdef" for character in hash):
             raise ObjectNotFoundError(hash)
 
         object_path = self._object_path(hash)
 
-        if not object_path.exists():
-            raise ObjectNotFoundError(hash)
+        if object_path.exists():
+            return self._read_loose_object(hash, object_path)
 
+        packed = self._read_packed_object(hash)
+        if packed is None:
+            raise ObjectNotFoundError(hash)
+        return packed
+
+    def pack_objects(self, hashes: Iterable[str]) -> tuple[Path, Path]:
+        """Pack selected objects and atomically publish a pack/index pair.
+        Reads through the public API to validate and deduplicate objects, then writes
+        a pack file and an index file. Returns the paths of the pack and index files.
+        """
+        selected: dict[str, tuple[str, bytes]] = {}
+        for obj_hash in hashes:
+            if obj_hash not in selected:
+                selected[obj_hash] = self.read_object(obj_hash)
+
+        self.pack_dir.mkdir(parents=True, exist_ok=True)
+        pack_id = uuid.uuid4().hex
+        pack_path = self.pack_dir / f"pack-{pack_id}.pack"
+        index_path = self.pack_dir / f"pack-{pack_id}.idx"
+        pack_temp: Path | None = None
+        index_temp: Path | None = None
+        entries: list[tuple[str, int, int]] = []
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=self.pack_dir, prefix=f".pack-{pack_id}.", suffix=".tmp", delete=False
+            ) as pack_file:
+                pack_temp = Path(pack_file.name)
+                pack_file.write(
+                    self._PACK_HEADER.pack(self._PACK_MAGIC, self._PACK_VERSION, len(selected))
+                )
+                for obj_hash, (obj_type, data) in selected.items():
+                    offset = pack_file.tell()
+                    compressed = zlib.compress(data)
+                    type_bytes = obj_type.encode("ascii")
+                    record = self._RECORD_HEADER.pack(len(type_bytes), len(data), len(compressed))
+                    pack_file.write(record)
+                    pack_file.write(type_bytes)
+                    pack_file.write(compressed)
+                    record_length = self._RECORD_HEADER.size + len(type_bytes) + len(compressed)
+                    entries.append((obj_hash, offset, record_length))
+                pack_file.flush()
+                os.fsync(pack_file.fileno())
+
+            self._validate_pack(pack_temp)
+            with tempfile.NamedTemporaryFile(
+                dir=self.pack_dir, prefix=f".pack-{pack_id}.", suffix=".tmp", delete=False
+            ) as index_file:
+                index_temp = Path(index_file.name)
+                ordered_entries = sorted(entries, key=lambda entry: entry[0])
+                index_file.write(
+                    self._INDEX_HEADER.pack(self._INDEX_MAGIC, self._PACK_VERSION, len(entries))
+                )
+                for obj_hash, offset, length in ordered_entries:
+                    index_file.write(
+                        self._INDEX_ENTRY.pack(bytes.fromhex(obj_hash), offset, length)
+                    )
+                index_file.flush()
+                os.fsync(index_file.fileno())
+
+            self._read_index(index_temp, pack_temp)
+            os.replace(pack_temp, pack_path)
+            pack_temp = None
+            os.replace(index_temp, index_path)
+            index_temp = None
+        finally:
+            if pack_temp is not None:
+                pack_temp.unlink(missing_ok=True)
+            if index_temp is not None:
+                index_temp.unlink(missing_ok=True)
+
+        return pack_path, index_path
+
+    def _read_loose_object(self, obj_hash: str, object_path: Path) -> tuple[str, bytes]:
         try:
             compressed_object = object_path.read_bytes()
             decompressor = zlib.decompressobj()
             raw_object = decompressor.decompress(compressed_object) + decompressor.flush()
             if not decompressor.eof or decompressor.unused_data or decompressor.unconsumed_tail:
-                raise ObjectCorruptError(hash)
+                raise ObjectCorruptError(obj_hash)
             header, separator, content = raw_object.partition(b"\0")
             if not separator:
-                raise ObjectCorruptError(hash)
+                raise ObjectCorruptError(obj_hash)
 
             header_fields = header.split(b" ")
             if len(header_fields) != 2:
-                raise ObjectCorruptError(hash)
+                raise ObjectCorruptError(obj_hash)
             obj_type_bytes, obj_length_bytes = header_fields
             obj_type = obj_type_bytes.decode("ascii")
             if obj_type not in self._OBJECT_TYPES or not obj_length_bytes.isdigit():
-                raise ObjectCorruptError(hash)
+                raise ObjectCorruptError(obj_hash)
             if int(obj_length_bytes) != len(content):
-                raise ObjectCorruptError(hash)
-
+                raise ObjectCorruptError(obj_hash)
         except (OSError, UnicodeDecodeError, ValueError, zlib.error) as error:
-            raise ObjectCorruptError(hash) from error
+            raise ObjectCorruptError(obj_hash) from error
 
-        if self.hash_object(content, obj_type) != hash:
-            raise ObjectCorruptError(hash)
+        if self.hash_object(content, obj_type) != obj_hash:
+            raise ObjectCorruptError(obj_hash)
+        return obj_type, content
 
+    def _read_packed_object(self, obj_hash: str) -> tuple[str, bytes] | None:
+        if not self.pack_dir.exists():
+            return None
+        for index_path in sorted(self.pack_dir.glob("pack-*.idx")):
+            entries, pack_path = self._read_index(index_path)
+            entry = entries.get(obj_hash)
+            if entry is None:
+                continue
+            offset, record_length = entry
+            try:
+                with pack_path.open("rb") as pack_file:
+                    pack_file.seek(offset)
+                    record = pack_file.read(record_length)
+            except OSError as error:
+                raise ObjectCorruptError(obj_hash) from error
+            return self._decode_packed_record(obj_hash, record)
+        return None
+
+    def _read_index(
+        self, index_path: Path, pack_path: Path | None = None
+    ) -> tuple[dict[str, tuple[int, int]], Path]:
+        try:
+            raw = index_path.read_bytes()
+            header_size = self._INDEX_HEADER.size
+            if len(raw) < header_size:
+                raise ValueError
+            magic, version, count = self._INDEX_HEADER.unpack(raw[:header_size])
+            if magic != self._INDEX_MAGIC or version != self._PACK_VERSION:
+                raise ValueError
+            expected_size = header_size + count * self._INDEX_ENTRY.size
+            if len(raw) != expected_size:
+                raise ValueError
+            entries: dict[str, tuple[int, int]] = {}
+            previous = ""
+            for position in range(count):
+                start = header_size + position * self._INDEX_ENTRY.size
+                raw_hash, offset, length = self._INDEX_ENTRY.unpack(
+                    raw[start : start + self._INDEX_ENTRY.size]
+                )
+                obj_hash = raw_hash.hex()
+                if obj_hash <= previous or not length or obj_hash in entries:
+                    raise ValueError
+                entries[obj_hash] = (offset, length)
+                previous = obj_hash
+            if pack_path is None:
+                pack_path = index_path.with_suffix(".pack")
+            self._validate_pack(pack_path, entries)
+            return entries, pack_path
+        except (OSError, ValueError, struct.error) as error:
+            raise ObjectCorruptError(index_path.name) from error
+
+    def _validate_pack(
+        self, pack_path: Path, entries: dict[str, tuple[int, int]] | None = None
+    ) -> None:
+        try:
+            raw = pack_path.read_bytes()
+            if len(raw) < self._PACK_HEADER.size:
+                raise ValueError
+            magic, version, count = self._PACK_HEADER.unpack(raw[: self._PACK_HEADER.size])
+            if magic != self._PACK_MAGIC or version != self._PACK_VERSION:
+                raise ValueError
+            position = self._PACK_HEADER.size
+            records: list[tuple[int, int]] = []
+            for _ in range(count):
+                if position + self._RECORD_HEADER.size > len(raw):
+                    raise ValueError
+                type_length, data_length, compressed_length = self._RECORD_HEADER.unpack(
+                    raw[position : position + self._RECORD_HEADER.size]
+                )
+                record_length = self._RECORD_HEADER.size + type_length + compressed_length
+                if (
+                    type_length not in {4, 5, 6}
+                    or not data_length >= 0
+                    or not compressed_length
+                    or position + record_length > len(raw)
+                ):
+                    raise ValueError
+                records.append((position, record_length))
+                position += record_length
+            if position != len(raw):
+                raise ValueError
+            if entries is not None:
+                valid_records = set(records)
+                indexed_records = list(entries.values())
+                if set(indexed_records) != valid_records or len(indexed_records) != count:
+                    raise ValueError
+        except (OSError, struct.error, ValueError) as error:
+            raise ObjectCorruptError(pack_path.name) from error
+
+    def _decode_packed_record(self, obj_hash: str, record: bytes) -> tuple[str, bytes]:
+        try:
+            if len(record) < self._RECORD_HEADER.size:
+                raise ValueError
+            type_length, data_length, compressed_length = self._RECORD_HEADER.unpack(
+                record[: self._RECORD_HEADER.size]
+            )
+            header_end = self._RECORD_HEADER.size + type_length
+            if len(record) != header_end + compressed_length:
+                raise ValueError
+            obj_type = record[self._RECORD_HEADER.size : header_end].decode("ascii")
+            if obj_type not in self._OBJECT_TYPES or data_length < 0:
+                raise ValueError
+            compressed = record[header_end:]
+            decompressor = zlib.decompressobj()
+            content = decompressor.decompress(compressed) + decompressor.flush()
+            if not decompressor.eof or decompressor.unused_data or decompressor.unconsumed_tail:
+                raise ValueError
+            if len(content) != data_length or self.hash_object(content, obj_type) != obj_hash:
+                raise ValueError
+        except (UnicodeDecodeError, ValueError, zlib.error) as error:
+            raise ObjectCorruptError(obj_hash) from error
         return obj_type, content
 
     def _object_path(self, hash: str) -> Path:

@@ -890,10 +890,9 @@ def test_cli_conflict_then_resolve_add_commit(tmp_path, monkeypatch):
     base = commit_file(m, "file.txt", "x\n", "base")
     m.create_branch("feature", base)
     ours = commit_file(m, "file.txt", "ours\n", "ours")
-    m.write_head("feature")
+    m.switch_branch("feature")
     theirs = commit_file(m, "file.txt", "theirs\n", "theirs")
-    m.write_head("main")
-    m.tree.write_index(m.tree.read_tree_entries(m.get_head_tree()))
+    m.switch_branch("main")
     with pytest.raises(MergeConflictError):
         CommitManager(str(tmp_path), store=m.store, tree=m.tree).merge("feature")
     assert main(["commit", "-m", "too-soon"]) == 1

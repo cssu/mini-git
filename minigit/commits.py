@@ -11,32 +11,46 @@ Build the `CommitManager` class here, per the interface contract.
 
 import os
 import time
+from dataclasses import dataclass
 
 from minigit.errors import (
+    MergeConflictError,
     MiniGitError,
     ObjectCorruptError,
     RefExistsError,
     RefNotFoundError,
 )
 from minigit.index import WorkingTree
-from minigit.objects import ObjectStore
+from minigit.objects import ObjectStore, TreeEntry
 
 
 def _cmd_commit(args) -> int:
     """Handle the 'minigit commit -m <message>' command"""
     manager = CommitManager()
+    pending = manager._read_pending_merge()
+    if pending is not None:
+        _, _, _, unresolved = pending
+        if unresolved:
+            raise MiniGitError("unresolved merge paths: " + ", ".join(unresolved))
     tree_hash = manager.tree.build_tree_from_index()
     branch = manager._current_branch()
-    last_commit = manager.read_ref(branch)
-    parents = [last_commit] if last_commit else []
+    if pending is None:
+        last_commit = manager.read_ref(branch)
+        parents = [last_commit] if last_commit else []
+        message = args.message
+    else:
+        ours, theirs, message, _ = pending
+        parents = [ours, theirs]
     author = manager.read_author()
     commit_hash = manager.create_commit(
         tree_hash,
         parents,
         author,
-        args.message,
+        message,
     )
-    print(f"[{branch} {commit_hash[:7]}] {args.message}")
+    if pending is not None:
+        manager._clear_pending_merge()
+    print(f"[{branch} {commit_hash[:7]}] {message}")
     return 0
 
 
@@ -222,6 +236,8 @@ class CommitManager:
         """
         Point HEAD at name and restore the working tree from that branch's commit
         """
+        if self._read_pending_merge() is not None:
+            raise MiniGitError("merge in progress")
         if not os.path.exists(self._ref_path(name)):
             raise RefNotFoundError(name)
         self._require_no_staged_changes()
@@ -334,12 +350,13 @@ class CommitManager:
             return sorted(os.listdir(self._refs_dir()))
 
     def merge(self, branch_name) -> str | None:
-        # Week 4 fast-forward / Week 5 three-way
-        """Fast-forward the current branch to `branch_name` when history allows it
+        """Fast-forward or three-way merge `branch_name` into the current branch.
 
-        Raises RefNotFoundError for an
-        unknown branch, and MiniGitError when the two histories have diverged.
+        Fast-forward and no-op cases return None. A clean three-way merge returns
+        the new commit hash. A text conflict raises MergeConflictError.
         """
+        if self._read_pending_merge() is not None:
+            raise MiniGitError("merge in progress")
         if not os.path.exists(self._ref_path(branch_name)):
             raise RefNotFoundError(branch_name)
 
@@ -357,7 +374,227 @@ class CommitManager:
             self.write_ref(current, target)
             return None
 
-        raise MiniGitError("three-way merge is not implemented yet")
+        return self._three_way_merge(current_hash, target, branch_name)
+
+    def find_merge_base(self, ours: str, theirs: str) -> str:
+        """Return the single lowest common ancestor of two commits."""
+        common = set(self.walk_history(ours)) & set(self.walk_history(theirs))
+        if not common:
+            raise MiniGitError("no common ancestor")
+        lowest = [
+            commit
+            for commit in common
+            if not any(other != commit and self.is_ancestor(commit, other) for other in common)
+        ]
+        if len(lowest) != 1:
+            raise MiniGitError("multiple merge bases")
+        return lowest[0]
+
+    def mark_path_resolved(self, path: str) -> None:
+        """Drop a path from MERGE_UNRESOLVED after an explicit add."""
+        pending = self._read_pending_merge()
+        if pending is None:
+            return
+        ours, theirs, message, unresolved = pending
+        remaining = [item for item in unresolved if item != path]
+        self._write_pending_merge(ours, theirs, message, remaining)
+
+    def _three_way_merge(self, current_hash: str, target: str, branch_name: str) -> str:
+        """Merge two diverged commits and either commit or raise MergeConflictError."""
+        base_hash = self.find_merge_base(current_hash, target)
+        base_map = self._flatten(self.read_commit(base_hash).tree)
+        ours_map = self._flatten(self.read_commit(current_hash).tree)
+        theirs_map = self._flatten(self.read_commit(target).tree)
+
+        result_files: dict[str, tuple[str, str]] = {}
+        conflict_paths: list[str] = []
+        for path in sorted(set(base_map) | set(ours_map) | set(theirs_map)):
+            base = base_map.get(path)
+            ours = ours_map.get(path)
+            theirs = theirs_map.get(path)
+            taken = self._take_side(base, ours, theirs)
+            if taken == "conflict":
+                conflict_paths.append(path)
+                marker = self._conflict_text(
+                    self._decode_entry(ours), self._decode_entry(theirs), branch_name
+                )
+                mode = ours[0] if ours else theirs[0]
+                result_files[path] = (mode, self.store.write_object(marker.encode(), "blob"))
+            elif taken == "merge-text":
+                merged = self._merge_blob_pair(base, ours, theirs)
+                if merged is None:
+                    conflict_paths.append(path)
+                    marker = self._conflict_text(
+                        self._decode_entry(ours), self._decode_entry(theirs), branch_name
+                    )
+                    result_files[path] = (ours[0], self.store.write_object(marker.encode(), "blob"))
+                else:
+                    result_files[path] = (ours[0], self.store.write_object(merged.encode(), "blob"))
+            elif taken is not None:
+                result_files[path] = taken
+
+        if self._has_file_directory_conflict(result_files):
+            raise MiniGitError("file/directory conflict")
+        self._require_no_staged_changes()
+        result_tree = self._build_tree_from_paths(result_files)
+        message = f"Merge branch '{branch_name}'"
+
+        if not conflict_paths:
+            self.tree.checkout(result_tree)
+            return self.create_commit(
+                result_tree, [current_hash, target], self.read_author(), message
+            )
+
+        pre_index = {entry.path: entry for entry in self.tree.read_index()}
+        self.tree.checkout(result_tree)
+        restored = []
+        for entry in self.tree.read_index():
+            if entry.path in conflict_paths:
+                if entry.path in pre_index:
+                    restored.append(pre_index[entry.path])
+                continue
+            restored.append(entry)
+        for path in conflict_paths:
+            if path in pre_index and all(entry.path != path for entry in restored):
+                restored.append(pre_index[path])
+        self.tree.write_index(restored)
+        self._write_pending_merge(current_hash, target, message, conflict_paths)
+        raise MergeConflictError(sorted(conflict_paths))
+
+    def _flatten(self, tree_hash: str) -> dict[str, tuple[str, str]]:
+        """Return path -> (mode, hash) using M2."""
+        return {e.path: (e.mode, e.hash) for e in self.tree.read_tree_entries(tree_hash)}
+
+    def _take_side(self, base, ours, theirs):
+        """Return the winning (mode, hash), None to delete, or a conflict/text-merge sentinel."""
+        if ours == theirs:
+            return ours
+        if ours == base:
+            return theirs
+        if theirs == base:
+            return ours
+        if ours is None or theirs is None:
+            return "conflict"
+        return "merge-text"
+
+    def _blob_bytes(self, blob_hash: str) -> bytes:
+        """Read a blob through M1."""
+        obj_type, data = self.store.read_object(blob_hash)
+        if obj_type != "blob":
+            raise ObjectCorruptError(blob_hash)
+        return data
+
+    def _decode_entry(self, entry: tuple[str, str] | None) -> str:
+        """Return blob text for a flattened entry, or empty string if the path is missing."""
+        if entry is None:
+            return ""
+        data = self._blob_bytes(entry[1])
+        if b"\0" in data:
+            raise MiniGitError("binary file cannot be merged")
+        try:
+            return data.decode()
+        except UnicodeDecodeError as error:
+            raise MiniGitError("binary file cannot be merged") from error
+
+    def _merge_blob_pair(self, base, ours, theirs) -> str | None:
+        """Merge two changed blobs against base. None means a text conflict."""
+        if ours[0] != theirs[0]:
+            raise MiniGitError("mode conflict")
+        ours_data = self._blob_bytes(ours[1])
+        theirs_data = self._blob_bytes(theirs[1])
+        base_data = self._blob_bytes(base[1]) if base else b""
+        if b"\0" in ours_data or b"\0" in theirs_data or b"\0" in base_data:
+            raise MiniGitError("binary file cannot be merged")
+        try:
+            return _merge_text(base_data.decode(), ours_data.decode(), theirs_data.decode())
+        except UnicodeDecodeError as error:
+            raise MiniGitError("binary file cannot be merged") from error
+
+    def _has_file_directory_conflict(self, result: dict[str, tuple[str, str]]) -> bool:
+        """Return True when a path is both a file and a parent of another path."""
+        paths = sorted(result)
+        for i, path in enumerate(paths):
+            prefix = path + "/"
+            for other in paths[i + 1 :]:
+                if other.startswith(prefix):
+                    return True
+        return False
+
+    def _build_tree_from_paths(self, files: dict[str, tuple[str, str]]) -> str:
+        """Write the result tree through M1."""
+        root: dict = {}
+        for path, (mode, blob_hash) in files.items():
+            node = root
+            parts = path.split("/")
+            for part in parts[:-1]:
+                node = node.setdefault(part, {})
+            node[parts[-1]] = (mode, blob_hash)
+
+        def write_dir(node: dict) -> str:
+            """Write one tree object from a nested path map."""
+            entries = []
+            for name in sorted(node):
+                value = node[name]
+                if isinstance(value, dict):
+                    entries.append(TreeEntry("40000", "tree", write_dir(value), name))
+                else:
+                    mode, blob_hash = value
+                    entries.append(TreeEntry(mode, "blob", blob_hash, name))
+            return self.store.write_tree(entries)
+
+        return write_dir(root)
+
+    def _conflict_text(self, ours_text: str, theirs_text: str, branch_name: str) -> str:
+        """Build a conflict-marker blob."""
+        return f"<<<<<<< HEAD\n{ours_text}=======\n{theirs_text}>>>>>>> {branch_name}\n"
+
+    def _merge_state_paths(self) -> dict[str, str]:
+        """Return the pending-merge file paths under `.minigit/`."""
+        meta = os.path.join(self.root, ".minigit")
+        return {
+            "ours": os.path.join(meta, "MERGE_OURS"),
+            "theirs": os.path.join(meta, "MERGE_HEAD"),
+            "message": os.path.join(meta, "MERGE_MSG"),
+            "unresolved": os.path.join(meta, "MERGE_UNRESOLVED"),
+        }
+
+    def _write_pending_merge(self, ours: str, theirs: str, message: str, paths: list[str]) -> None:
+        """Save both parents, the merge message, and unresolved paths."""
+        paths_map = self._merge_state_paths()
+        os.makedirs(os.path.join(self.root, ".minigit"), exist_ok=True)
+        with open(paths_map["ours"], "w") as handle:
+            handle.write(ours + "\n")
+        with open(paths_map["theirs"], "w") as handle:
+            handle.write(theirs + "\n")
+        with open(paths_map["message"], "w") as handle:
+            handle.write(message + "\n")
+        with open(paths_map["unresolved"], "w") as handle:
+            handle.write("".join(path + "\n" for path in sorted(paths)))
+
+    def _read_pending_merge(self) -> tuple[str, str, str, list[str]] | None:
+        """Return (ours, theirs, message, unresolved paths), or None if no merge is pending."""
+        paths_map = self._merge_state_paths()
+        if not os.path.exists(paths_map["theirs"]):
+            return None
+
+        def read(path: str) -> str:
+            """Read a pending-merge file as text."""
+            with open(path) as handle:
+                return handle.read()
+
+        unresolved = [line for line in read(paths_map["unresolved"]).splitlines() if line]
+        return (
+            read(paths_map["ours"]).strip(),
+            read(paths_map["theirs"]).strip(),
+            read(paths_map["message"]).strip(),
+            unresolved,
+        )
+
+    def _clear_pending_merge(self) -> None:
+        """Delete pending-merge files after a completed merge commit."""
+        for path in self._merge_state_paths().values():
+            if os.path.exists(path):
+                os.remove(path)
 
     def log(self) -> list[str]:
         """Return one summary line per commit reachable from HEAD, newest first"""
@@ -375,3 +612,85 @@ class CommitManager:
             lines.append(f"{i[:7]} {summary}")
 
         return lines
+
+
+@dataclass
+class Hunk:
+    """One edit against the base file"""
+
+    base_start: int
+    base_count: int
+    lines: list[str]
+
+
+def _diff_lines(base: list[str], other: list[str]) -> list[Hunk]:
+    """Fake line diff"""
+    hunks = []
+    i = 0
+    j = 0
+    while i < len(base) or j < len(other):
+        if i < len(base) and j < len(other) and base[i] == other[j]:
+            i += 1
+            j += 1
+            continue
+        start_i, start_j = i, j
+        if i < len(base) and (j >= len(other) or base[i] not in other[j:]):
+            i += 1
+        elif j < len(other) and (i >= len(base) or other[j] not in base[i:]):
+            j += 1
+        else:
+            i += 1
+            j += 1
+        hunks.append(Hunk(start_i, i - start_i, other[start_j:j]))
+    return hunks
+
+
+def _ranges_overlap(a: Hunk, b: Hunk) -> bool:
+    """True if hunks overlap or insert at the same base index"""
+    if a.base_count == 0 and b.base_count == 0:
+        return a.base_start == b.base_start
+    return a.base_start < b.base_start + b.base_count and b.base_start < a.base_start + a.base_count
+
+
+def _combine_hunks(ours: list[Hunk], theirs: list[Hunk]) -> list[Hunk] | None:
+    """Combine disjoint hunks"""
+    merged = []
+    for hunk in ours + theirs:
+        skip = False
+        for existing in merged:
+            if (existing.base_start, existing.base_count, existing.lines) == (
+                hunk.base_start,
+                hunk.base_count,
+                hunk.lines,
+            ):
+                skip = True
+                break
+            if _ranges_overlap(existing, hunk):
+                return None
+        if not skip:
+            merged.append(hunk)
+    return sorted(merged, key=lambda hunk: hunk.base_start)
+
+
+def _apply_hunks(base_lines: list[str], hunks: list[Hunk]) -> list[str]:
+    """Apply combined hunks to base."""
+    result = []
+    index = 0
+    for hunk in hunks:
+        result.extend(base_lines[index : hunk.base_start])
+        result.extend(hunk.lines)
+        index = hunk.base_start + hunk.base_count
+    result.extend(base_lines[index:])
+    return result
+
+
+def _merge_text(base_text: str, ours_text: str, theirs_text: str) -> str | None:
+    """Diff each side against base. Combine or conflict"""
+    base_lines = base_text.split("\n")
+    combined = _combine_hunks(
+        _diff_lines(base_lines, ours_text.split("\n")),
+        _diff_lines(base_lines, theirs_text.split("\n")),
+    )
+    if combined is None:
+        return None
+    return "\n".join(_apply_hunks(base_lines, combined))

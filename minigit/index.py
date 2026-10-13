@@ -299,8 +299,17 @@ class WorkingTree:
 
 
 def cmd_add(args) -> int:
+    """Stage a path. During a merge, that path is marked resolved."""
     wt = WorkingTree()
-    wt.stage_file(args.path)
+    full_path = os.path.join(wt.root, args.path)
+    if os.path.isfile(full_path):
+        wt.stage_file(args.path)
+    else:
+        entries = [entry for entry in wt.read_index() if entry.path != args.path]
+        wt.write_index(entries)
+    from minigit.commits import CommitManager
+
+    CommitManager(wt.root, store=wt.store, tree=wt).mark_path_resolved(args.path)
     return 0
 
 

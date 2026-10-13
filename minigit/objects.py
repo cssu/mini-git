@@ -159,9 +159,6 @@ class ObjectStore:
                 os.fsync(pack_file.fileno())
 
             self._validate_pack(pack_temp)
-            os.replace(pack_temp, pack_path)
-            pack_temp = None
-
             with tempfile.NamedTemporaryFile(
                 dir=self.pack_dir, prefix=f".pack-{pack_id}.", suffix=".tmp", delete=False
             ) as index_file:
@@ -177,7 +174,9 @@ class ObjectStore:
                 index_file.flush()
                 os.fsync(index_file.fileno())
 
-            self._read_index(index_temp, pack_path)
+            self._read_index(index_temp, pack_temp)
+            os.replace(pack_temp, pack_path)
+            pack_temp = None
             os.replace(index_temp, index_path)
             index_temp = None
         finally:
@@ -299,9 +298,7 @@ class ObjectStore:
             if entries is not None:
                 valid_records = set(records)
                 indexed_records = list(entries.values())
-                if any(entry not in valid_records for entry in indexed_records) or len(
-                    set(indexed_records)
-                ) != len(indexed_records):
+                if set(indexed_records) != valid_records or len(indexed_records) != count:
                     raise ValueError
         except (OSError, struct.error, ValueError) as error:
             raise ObjectCorruptError(pack_path.name) from error

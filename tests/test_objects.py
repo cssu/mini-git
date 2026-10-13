@@ -498,3 +498,18 @@ def test_write_rejects_unsupported_type_without_creating_objects(tmp_path, obj_t
     with pytest.raises(ValueError, match="unsupported object type"):
         store.write_object(b"data", obj_type)
     assert not store.objects_dir.exists()
+
+
+def test_pack_index_must_cover_every_record(tmp_path):
+    store = ObjectStore(tmp_path)
+    hashes = [store.write_object(data, "blob") for data in (b"one", b"two")]
+    _, index = store.pack_objects(hashes)
+    raw = index.read_bytes()
+    index.write_bytes(
+        store._INDEX_HEADER.pack(store._INDEX_MAGIC, store._PACK_VERSION, 1)
+        + raw[store._INDEX_HEADER.size : -store._INDEX_ENTRY.size]
+    )
+    for obj_hash in hashes:
+        store._object_path(obj_hash).unlink()
+    with pytest.raises(ObjectCorruptError):
+        ObjectStore(tmp_path).read_object(hashes[0])

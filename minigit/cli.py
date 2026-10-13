@@ -70,7 +70,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args, unknown = parser.parse_known_args(argv)
+    if unknown:
+        if (
+            getattr(args, "command", None) in {"push", "pull"}
+            and len(unknown) == 1
+            and not unknown[0].startswith("-")
+            and getattr(args, "branch", None) is None
+        ):
+            args.branch = unknown[0]
+        else:
+            parser.error(f"unrecognized arguments: {' '.join(unknown)}")
 
     handler = getattr(args, "handler", None)
     if handler is None:

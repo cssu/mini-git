@@ -206,12 +206,17 @@ class WorkingTree:
 
     def stage_file(self, path) -> None:
         full_path = os.path.join(self.root, path)
-
-        if not os.path.isfile(full_path):
-            raise MiniGitError(f"No such file: {path}")
-
         rel_path = os.path.relpath(full_path, self.root)
         rel_path = rel_path.replace(os.sep, "/")
+
+        if not os.path.isfile(full_path):
+            # A tracked file that is gone from disk: staging it stages the deletion.
+            entries = self.read_index()
+            remaining = [e for e in entries if e.path != rel_path]
+            if len(remaining) == len(entries):
+                raise MiniGitError(f"No such file: {path}")
+            self.write_index(remaining)
+            return
 
         with open(full_path, "rb") as f:
             data = f.read()
@@ -367,9 +372,20 @@ class WorkingTree:
 
         return result
 
-    def checkout(self, tree_hash) -> None:
+    def checkout(self, tree_hash, conflicted_paths=()) -> None:
+        """Make the working files and the index match `tree_hash`.
+
+        `conflicted_paths` (used by a merge) are written to disk like every other
+        path - their blob in the tree holds the conflict markers - but their index
+        entry stays at its pre-merge version (or is left out if there was none), so
+        status reports them as "not staged" until `add` resolves them.
+        """
         target_entries = self.read_tree_entries(tree_hash)
         target_by_path = {e.path: e for e in target_entries}
+
+        conflicted = set(conflicted_paths)
+        for path in sorted(conflicted - set(target_by_path)):
+            raise MiniGitError(f"conflicted path is not in the target tree: {path}")
 
         # Reject unsafe paths
         blob_cache = {}
@@ -444,8 +460,14 @@ class WorkingTree:
                 f.write(blob_cache[entry.path])
             os.chmod(full_path, 0o755 if entry.mode == "100755" else 0o644)
 
-        # Now matched
-        self.write_index(target_entries)
+        # Now matched - except conflicted paths, which keep their pre-merge entry.
+        index_entries = []
+        for entry in target_entries:
+            if entry.path not in conflicted:
+                index_entries.append(entry)
+            elif entry.path in current_by_path:
+                index_entries.append(current_by_path[entry.path])
+        self.write_index(index_entries)
 
     def _validate_checkout_path(self, path: str) -> None:
         if (

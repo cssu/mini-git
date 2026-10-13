@@ -1,18 +1,23 @@
-"""Tests for minigit/index.py - WorkingTree, trees, diffing, status, checkout, and Myers diff."""
+"""Tests for minigit/index.py - WorkingTree, trees, diffing, status, checkout, Myers diff,
+and pull / merge-result handling."""
 
+import argparse
+import hashlib
 import os
 import random
+import shutil
 import sys
 import types
 
 import pytest
 
 from minigit.commits import CommitManager
-from minigit.errors import MiniGitError
+from minigit.errors import MiniGitError, ObjectNotFoundError
 from minigit.index import (
     LineEdit,
     WorkingTree,
     apply_edits,
+    cmd_add,
     cmd_diff,
     cmd_status,
     myers_diff,
@@ -867,3 +872,371 @@ def test_checkout_applies_a_merge_tree_with_conflict_markers(repo):
         assert f.read() == b"added by merge\n"
     assert [e.path for e in repo.read_index()] == ["a.txt", "b.txt"]
     assert repo.diff_working_tree_vs(merge_tree).line_diffs == {}
+
+
+# ---------------------------------------------------------------------------
+# Week 6: pull (fast-forward), safe checkout, merge results
+# ---------------------------------------------------------------------------
+
+
+class Repo:
+    """One repository: real object store, working tree and commit manager."""
+
+    def __init__(self, root):
+        self.root = str(root)
+        os.makedirs(self.root, exist_ok=True)
+        self.store = ObjectStore(self.root)
+        self.wt = WorkingTree(self.root, store=self.store)
+        self.cm = CommitManager(self.root, store=self.store, tree=self.wt)
+
+    def path(self, name):
+        return os.path.join(self.root, name)
+
+    def write(self, name, content, mode=None):
+        full = self.path(name)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as f:
+            f.write(content if isinstance(content, bytes) else content.encode())
+        if mode is not None:
+            os.chmod(full, mode)
+
+    def read(self, name):
+        with open(self.path(name), "rb") as f:
+            return f.read()
+
+    def exists(self, name):
+        return os.path.lexists(self.path(name))
+
+    def remove(self, name):
+        os.remove(self.path(name))
+
+    def stage(self, *names):
+        for name in names:
+            self.wt.stage_file(name)
+
+    def commit(self, message, extra_parents=()):
+        """Commit whatever is in the index on the current branch."""
+        branch = self.cm._current_branch()
+        tip = self.cm.read_ref(branch)
+        parents = ([tip] if tip else []) + list(extra_parents)
+        tree = self.wt.build_tree_from_index()
+        return self.cm.create_commit(tree, parents, "Test <t@example.com>", message)
+
+    def snapshot(self):
+        """Everything that defines repo state: files on disk, index, refs, HEAD."""
+        files = {}
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = [d for d in dirnames if d not in {".minigit"}]
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                rel = os.path.relpath(full, self.root)
+                with open(full, "rb") as f:
+                    files[rel] = (f.read(), os.access(full, os.X_OK))
+        meta = {}
+        for sub in ("index", "HEAD"):
+            full = os.path.join(self.root, ".minigit", sub)
+            if os.path.exists(full):
+                with open(full, "rb") as f:
+                    meta[sub] = f.read()
+        refs = os.path.join(self.root, ".minigit", "refs", "heads")
+        if os.path.isdir(refs):
+            for name in sorted(os.listdir(refs)):
+                with open(os.path.join(refs, name), "rb") as f:
+                    meta[f"ref:{name}"] = f.read()
+        return files, meta
+
+    def object_files(self):
+        found = {}
+        for dirpath, _, filenames in os.walk(os.path.join(self.root, ".minigit", "objects")):
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                found[full] = os.path.getmtime(full)
+        return found
+
+
+def download(source: Repo, target: Repo, branch="main", as_ref="theirs"):
+    """Stand-in for fetch: copy every object over and point `as_ref` at the source tip."""
+    src_objects = os.path.join(source.root, ".minigit", "objects")
+    dst_objects = os.path.join(target.root, ".minigit", "objects")
+    shutil.copytree(src_objects, dst_objects, dirs_exist_ok=True)
+    target.cm.write_ref(as_ref, source.cm.read_ref(branch))
+
+
+def status_text(repo, monkeypatch, capsys):
+    monkeypatch.chdir(repo.root)
+    assert cmd_status(None) == 0
+    return capsys.readouterr().out
+
+
+def diff_text(repo, monkeypatch, capsys):
+    monkeypatch.chdir(repo.root)
+    assert cmd_diff(None) == 0
+    return capsys.readouterr().out
+
+
+@pytest.fixture
+def source(tmp_path):
+    """A 'remote' repo with one commit: nested dirs, an executable, binary, unicode."""
+    repo = Repo(tmp_path / "source")
+    repo.write("README.md", "hello\n")
+    repo.write("src/app.py", "print('v1')\n")
+    repo.write("src/deep/util.py", "x = 1\n")
+    repo.write("run.sh", "#!/bin/sh\necho hi\n", mode=0o755)
+    repo.write("data.bin", b"\x00\x01\xff\xfe")
+    repo.write("café.txt", "crème\n")
+    repo.write("noeol.txt", "no newline at end")
+    repo.stage(
+        "README.md", "src/app.py", "src/deep/util.py", "run.sh", "data.bin", "café.txt",
+        "noeol.txt",
+    )  # fmt: skip
+    repo.commit("first")
+    return repo
+
+
+@pytest.fixture
+def local(tmp_path):
+    return Repo(tmp_path / "local")
+
+
+# ---------------------------------------------------------------------------
+# Fast-forward: files, deletions, nested directories, modes, index, status
+# ---------------------------------------------------------------------------
+
+
+def test_fast_forward_into_fresh_repo_restores_everything(source, local, monkeypatch, capsys):
+    download(source, local)
+
+    local.cm.merge("theirs")
+
+    assert local.read("README.md") == b"hello\n"
+    assert local.read("src/deep/util.py") == b"x = 1\n"
+    assert local.read("data.bin") == b"\x00\x01\xff\xfe"
+    assert local.read("café.txt") == "crème\n".encode()
+    assert local.read("noeol.txt") == b"no newline at end"
+    assert os.access(local.path("run.sh"), os.X_OK)
+    assert not os.access(local.path("README.md"), os.X_OK)
+    assert [e.path for e in local.wt.read_index()] == sorted(e.path for e in source.wt.read_index())
+    assert local.cm._current_branch() == "main"
+    assert local.cm.read_ref("main") == source.cm.read_ref("main")
+    assert status_text(local, monkeypatch, capsys) == "clean\n"
+    assert diff_text(local, monkeypatch, capsys) == ""
+
+
+def test_second_fast_forward_applies_edit_delete_new_dir_and_mode(
+    source, local, monkeypatch, capsys
+):
+    download(source, local)
+    local.cm.merge("theirs")
+
+    source.write("README.md", "hello again\n")
+    source.remove("src/deep/util.py")  # last file in src/deep -> directory must go too
+    source.write("docs/guide/intro.md", "intro\n")
+    os.chmod(source.path("run.sh"), 0o644)
+    source.stage("README.md", "src/deep/util.py", "docs/guide/intro.md", "run.sh")
+    source.commit("second")
+    download(source, local)
+
+    local.cm.merge("theirs")
+
+    assert local.read("README.md") == b"hello again\n"
+    assert not local.exists("src/deep/util.py")
+    assert not local.exists("src/deep")
+    assert local.read("docs/guide/intro.md") == b"intro\n"
+    assert not os.access(local.path("run.sh"), os.X_OK)
+    assert local.cm._current_branch() == "main"
+    assert status_text(local, monkeypatch, capsys) == "clean\n"
+    assert diff_text(local, monkeypatch, capsys) == ""
+
+
+# ---------------------------------------------------------------------------
+# Local work is preserved; validation failures change nothing
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def synced(source, local):
+    """`local` already has the first commit; `source` then moves ahead."""
+    download(source, local)
+    local.cm.merge("theirs")
+    source.write("README.md", "hello from upstream\n")
+    source.write("added.txt", "new upstream file\n")
+    source.stage("README.md", "added.txt")
+    source.commit("second")
+    download(source, local)
+    return source, local
+
+
+def test_dirty_tracked_file_blocks_pull_and_is_kept(synced):
+    _, local = synced
+    local.write("README.md", "my local edit\n")
+    before = local.snapshot()
+
+    with pytest.raises(MiniGitError):
+        local.cm.merge("theirs")
+
+    assert local.snapshot() == before
+    assert local.read("README.md") == b"my local edit\n"
+    assert not local.exists("added.txt")
+
+
+def test_untracked_collision_blocks_pull_and_is_kept(synced):
+    _, local = synced
+    local.write("added.txt", "my untracked file\n")
+    before = local.snapshot()
+
+    with pytest.raises(MiniGitError):
+        local.cm.merge("theirs")
+
+    assert local.snapshot() == before
+    assert local.read("added.txt") == b"my untracked file\n"
+
+
+def test_missing_blob_leaves_files_and_index_untouched(synced):
+    source, local = synced
+    new_blob = next(e.hash for e in source.wt.read_index() if e.path == "added.txt")
+    os.remove(os.path.join(local.root, ".minigit", "objects", new_blob[:2], new_blob[2:]))
+    before = local.snapshot()
+
+    with pytest.raises(ObjectNotFoundError):
+        local.cm.merge("theirs")
+
+    assert local.snapshot() == before
+
+
+def test_unsafe_path_in_incoming_tree_changes_nothing(local):
+    local.write("keep.txt", "mine\n")
+    local.stage("keep.txt")
+    local.commit("base")
+    blob = local.store.write_object(b"evil", "blob")
+    sub = local.store.write_tree([TreeEntry("100644", "blob", blob, "x")])
+    # a tree whose directory is named ".minigit" would write inside the repo's own data
+    tree = local.store.write_tree(
+        [
+            TreeEntry("40000", "tree", sub, ".minigit"),
+            TreeEntry("100644", "blob", blob, "keep.txt"),
+        ]
+    )
+    before = local.snapshot()
+
+    with pytest.raises(MiniGitError):
+        local.wt.checkout(tree)
+
+    assert local.snapshot() == before
+
+
+# ---------------------------------------------------------------------------
+# Status and diff are read-only
+# ---------------------------------------------------------------------------
+
+
+def test_status_and_diff_do_not_change_the_repo(synced, monkeypatch, capsys):
+    _, local = synced
+    local.cm.merge("theirs")
+    local.write("README.md", "edited after pull\n")
+    local.write("untracked.txt", "u\n")
+    local.write("staged.txt", "s\n")
+    local.stage("staged.txt")
+    before_state = local.snapshot()
+    before_objects = local.object_files()
+
+    status_text(local, monkeypatch, capsys)
+    diff_text(local, monkeypatch, capsys)
+
+    assert local.snapshot() == before_state
+    assert local.object_files() == before_objects
+
+
+# ---------------------------------------------------------------------------
+# Merge results: markers on disk, pre-merge index entries, resolution via `add`
+# ---------------------------------------------------------------------------
+
+MARKERS = b"<<<<<<< ours\nmine\n=======\ntheirs\n>>>>>>> theirs\n"
+
+
+@pytest.fixture
+def merging(local):
+    """A repo with a commit, plus the tree M3 would build for a conflicting merge."""
+    local.write("a.txt", "base\n")
+    local.write("b.txt", "unchanged\n")
+    local.stage("a.txt", "b.txt")
+    local.commit("ours")
+    marker_blob = local.store.write_object(MARKERS, "blob")
+    clean_blob = local.store.write_object(b"added by theirs\n", "blob")
+    b_blob = next(e.hash for e in local.wt.read_index() if e.path == "b.txt")
+    merged_tree = local.store.write_tree(
+        [
+            TreeEntry("100644", "blob", marker_blob, "a.txt"),
+            TreeEntry("100644", "blob", b_blob, "b.txt"),
+            TreeEntry("100644", "blob", clean_blob, "c.txt"),
+        ]
+    )
+    return local, merged_tree
+
+
+def test_conflicted_path_gets_markers_but_keeps_pre_merge_index_entry(merging, monkeypatch, capsys):
+    local, merged_tree = merging
+    old_a = next(e for e in local.wt.read_index() if e.path == "a.txt")
+
+    local.wt.checkout(merged_tree, conflicted_paths={"a.txt"})
+
+    assert local.read("a.txt") == MARKERS
+    assert local.read("c.txt") == b"added by theirs\n"
+    index = {e.path: e for e in local.wt.read_index()}
+    assert index["a.txt"] == old_a
+    assert index["c.txt"].hash == hashlib.sha1(b"blob 16\0added by theirs\n").hexdigest()
+    assert status_text(local, monkeypatch, capsys) == "staged:\n  c.txt\nnot staged:\n  a.txt\n"
+
+
+def test_conflicted_checkout_of_unknown_path_is_refused_before_any_write(merging):
+    local, merged_tree = merging
+    before = local.snapshot()
+
+    with pytest.raises(MiniGitError):
+        local.wt.checkout(merged_tree, conflicted_paths={"nope.txt"})
+
+    assert local.snapshot() == before
+
+
+def test_resolve_with_add_then_commit_is_clean_across_fresh_objects(merging, monkeypatch, capsys):
+    local, merged_tree = merging
+    local.wt.checkout(merged_tree, conflicted_paths={"a.txt"})
+    theirs_tip = local.cm.read_ref("main")  # stand-in for the second parent
+
+    # each step below uses brand-new objects, like separate CLI processes would
+    fresh = Repo(local.root)
+    fresh.write("a.txt", "resolved by hand\n")
+    monkeypatch.chdir(fresh.root)
+    assert cmd_add(argparse.Namespace(path="a.txt")) == 0
+
+    fresh = Repo(local.root)
+    assert status_text(fresh, monkeypatch, capsys) == "staged:\n  a.txt\n  c.txt\n"
+
+    fresh = Repo(local.root)
+    fresh.commit("merge", extra_parents=[theirs_tip])
+
+    fresh = Repo(local.root)
+    assert status_text(fresh, monkeypatch, capsys) == "clean\n"
+    assert fresh.read("a.txt") == b"resolved by hand\n"
+    assert len(fresh.cm.read_commit(fresh.cm.read_ref("main")).parents) == 2
+
+
+def test_resolved_deletion_with_add_then_commit(merging, monkeypatch, capsys):
+    local, merged_tree = merging
+    local.wt.checkout(merged_tree, conflicted_paths={"a.txt"})
+
+    local.remove("a.txt")
+    monkeypatch.chdir(local.root)
+    assert cmd_add(argparse.Namespace(path="a.txt")) == 0
+
+    fresh = Repo(local.root)
+    assert [e.path for e in fresh.wt.read_index()] == ["b.txt", "c.txt"]
+    assert status_text(fresh, monkeypatch, capsys) == "staged:\n  a.txt\n  c.txt\n"
+    fresh.commit("merge: delete a.txt")
+    fresh = Repo(local.root)
+    assert status_text(fresh, monkeypatch, capsys) == "clean\n"
+    assert not fresh.exists("a.txt")
+
+
+def test_add_of_a_missing_untracked_path_still_fails(local):
+    with pytest.raises(MiniGitError, match="No such file"):
+        local.wt.stage_file("never-existed.txt")

@@ -387,7 +387,8 @@ def make_real_manager(temp_path):
 
 def commit_file(m, path, contents, message):
     """Write `contents` to `path`, stage it, and commit on the current branch."""
-    (Path(m.root) / path).write_text(contents)
+    with open(Path(m.root) / path, "w", encoding="utf-8", newline="") as file:
+        file.write(contents)
     m.tree.stage_file(path)
     parent = m.read_ref(m._current_branch())
     parents = [parent] if parent else []

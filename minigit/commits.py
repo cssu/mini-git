@@ -20,7 +20,7 @@ from minigit.errors import (
     RefExistsError,
     RefNotFoundError,
 )
-from minigit.index import WorkingTree
+from minigit.index import WorkingTree, myers_diff, split_lines
 from minigit.objects import ObjectStore, TreeEntry
 
 
@@ -37,10 +37,10 @@ def _cmd_commit(args) -> int:
     if pending is None:
         last_commit = manager.read_ref(branch)
         parents = [last_commit] if last_commit else []
-        message = args.message
     else:
-        ours, theirs, message, _ = pending
+        ours, theirs, _, _ = pending
         parents = [ours, theirs]
+    message = args.message
     author = manager.read_author()
     commit_hash = manager.create_commit(
         tree_hash,
@@ -121,7 +121,7 @@ def register_subcommands(subparsers) -> None:
     log_parser = subparsers.add_parser("log", help="show commit history")
     log_parser.set_defaults(handler=_cmd_log)
 
-    merge_parser = subparsers.add_parser("merge", help="fast-forward the current branch")
+    merge_parser = subparsers.add_parser("merge", help="merge a branch into the current branch")
     merge_parser.add_argument("branch", help="branch name to merge in")
     merge_parser.set_defaults(handler=_cmd_merge)
 
@@ -546,6 +546,10 @@ class CommitManager:
 
     def _conflict_text(self, ours_text: str, theirs_text: str, branch_name: str) -> str:
         """Build a conflict-marker blob."""
+        if ours_text and not ours_text.endswith("\n"):
+            ours_text += "\n"
+        if theirs_text and not theirs_text.endswith("\n"):
+            theirs_text += "\n"
         return f"<<<<<<< HEAD\n{ours_text}=======\n{theirs_text}>>>>>>> {branch_name}\n"
 
     def _merge_state_paths(self) -> dict[str, str]:
@@ -582,7 +586,7 @@ class CommitManager:
             with open(path) as handle:
                 return handle.read()
 
-        unresolved = [line for line in read(paths_map["unresolved"]).splitlines() if line]
+        unresolved = [line for line in read(paths_map["unresolved"]).split("\n") if line]
         return (
             read(paths_map["ours"]).strip(),
             read(paths_map["theirs"]).strip(),
@@ -624,25 +628,8 @@ class Hunk:
 
 
 def _diff_lines(base: list[str], other: list[str]) -> list[Hunk]:
-    """Fake line diff"""
-    hunks = []
-    i = 0
-    j = 0
-    while i < len(base) or j < len(other):
-        if i < len(base) and j < len(other) and base[i] == other[j]:
-            i += 1
-            j += 1
-            continue
-        start_i, start_j = i, j
-        if i < len(base) and (j >= len(other) or base[i] not in other[j:]):
-            i += 1
-        elif j < len(other) and (i >= len(base) or other[j] not in base[i:]):
-            j += 1
-        else:
-            i += 1
-            j += 1
-        hunks.append(Hunk(start_i, i - start_i, other[start_j:j]))
-    return hunks
+    """Adapt M2's Myers edits without changing their base coordinates."""
+    return [Hunk(edit.start, edit.old_count, edit.new_lines) for edit in myers_diff(base, other)]
 
 
 def _ranges_overlap(a: Hunk, b: Hunk) -> bool:
@@ -669,7 +656,7 @@ def _combine_hunks(ours: list[Hunk], theirs: list[Hunk]) -> list[Hunk] | None:
                 return None
         if not skip:
             merged.append(hunk)
-    return sorted(merged, key=lambda hunk: hunk.base_start)
+    return sorted(merged, key=lambda hunk: (hunk.base_start, hunk.base_count))
 
 
 def _apply_hunks(base_lines: list[str], hunks: list[Hunk]) -> list[str]:
@@ -686,11 +673,11 @@ def _apply_hunks(base_lines: list[str], hunks: list[Hunk]) -> list[str]:
 
 def _merge_text(base_text: str, ours_text: str, theirs_text: str) -> str | None:
     """Diff each side against base. Combine or conflict"""
-    base_lines = base_text.split("\n")
+    base_lines = split_lines(base_text)
     combined = _combine_hunks(
-        _diff_lines(base_lines, ours_text.split("\n")),
-        _diff_lines(base_lines, theirs_text.split("\n")),
+        _diff_lines(base_lines, split_lines(ours_text)),
+        _diff_lines(base_lines, split_lines(theirs_text)),
     )
     if combined is None:
         return None
-    return "\n".join(_apply_hunks(base_lines, combined))
+    return "".join(_apply_hunks(base_lines, combined))

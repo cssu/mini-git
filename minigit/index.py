@@ -10,7 +10,8 @@ Build the `WorkingTree` class here, per the interface contract.
 """
 
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 from minigit.errors import MiniGitError, ObjectCorruptError
@@ -22,11 +23,147 @@ class IndexEntry(NamedTuple):
     path: str
 
 
+class LineEdit(NamedTuple):
+    """One change, in the coordinates of the OLD (base) list of lines.
+
+    Replace `old_count` lines starting at index `start` with `new_lines`.
+    A pure insert has old_count == 0; a pure delete has new_lines == [].
+    """
+
+    start: int
+    old_count: int
+    new_lines: list
+
+
 @dataclass
 class DiffResult:
     added: list
     deleted: list
     modified: list
+    # path -> list[LineEdit] for text files, or None for binary / undecodable files.
+    # A mode-only change has an empty list. Ignored by == so filename-list checks still work.
+    line_diffs: dict = field(default_factory=dict, compare=False)
+
+
+class _FileChange(NamedTuple):
+    path: str
+    status: str  # "added" | "deleted" | "modified"
+    old_mode: str | None
+    new_mode: str | None
+    old_lines: list  # [] when binary
+    edits: list  # [] when binary
+    binary: bool
+    content_changed: bool
+
+
+# ---------------------------------------------------------------------------
+# Myers line diff (pure functions - no files, no store)
+# ---------------------------------------------------------------------------
+
+
+def split_lines(text: str) -> list[str]:
+    """Split on "\n" only, keeping the newline on each line.
+
+    "a\nb" -> ["a\n", "b"]; a missing final newline stays visible as a last
+    line without "\n". (str.splitlines would also split on \r, \x0c, etc.)
+    """
+    return re.findall(r"[^\n]*\n|[^\n]+", text)
+
+
+def myers_diff(a: list, b: list) -> list[LineEdit]:
+    """Return the shortest list of LineEdit that turns `a` into `b`."""
+    return _group_ops(_shortest_path(a, b))
+
+
+def _shortest_path(a: list, b: list) -> list:
+    n, m = len(a), len(b)
+    if n == 0 and m == 0:
+        return []
+
+    # v[k] = furthest x reached on diagonal k, where k = x - y.
+    v = {1: 0}
+    trace = []  # trace[d] = copy of v at the start of round d
+
+    for d in range(n + m + 1):
+        trace.append(dict(v))
+        for k in range(-d, d + 1, 2):
+            if k == -d or (k != d and v[k - 1] < v[k + 1]):
+                x = v[k + 1]  # step down: insert a line from b
+            else:
+                x = v[k - 1] + 1  # step right: delete a line from a
+            y = x - k
+            while x < n and y < m and a[x] == b[y]:  # matching lines are free
+                x += 1
+                y += 1
+            v[k] = x
+            if x >= n and y >= m:
+                return _backtrack(b, trace, d, n, m)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _backtrack(b: list, trace: list, last_d: int, n: int, m: int) -> list:
+    x, y = n, m
+    ops = []  # ("del", old_index) or ("ins", old_index, line)
+
+    for d in range(last_d, 0, -1):
+        v = trace[d]
+        k = x - y
+        if k == -d or (k != d and v[k - 1] < v[k + 1]):
+            prev_k = k + 1  # came from above: an insertion
+        else:
+            prev_k = k - 1  # came from the left: a deletion
+        prev_x = v[prev_k]
+        prev_y = prev_x - prev_k
+
+        while x > prev_x and y > prev_y:  # walk back over matching lines
+            x -= 1
+            y -= 1
+
+        if prev_k == k + 1:
+            ops.append(("ins", prev_x, b[prev_y]))
+        else:
+            ops.append(("del", prev_x))
+        x, y = prev_x, prev_y
+
+    ops.reverse()
+    return ops
+
+
+def _group_ops(ops: list) -> list[LineEdit]:
+    """Merge neighbouring del/ins ops into LineEdit(start, old_count, new_lines)."""
+    edits = []
+    current = None  # [start, old_count, new_lines]
+    for op in ops:
+        pos = op[1]
+        if current is None or pos != current[0] + current[1]:
+            if current is not None:
+                edits.append(LineEdit(*current))
+            current = [pos, 0, []]
+        if op[0] == "del":
+            current[1] += 1
+        else:
+            current[2].append(op[2])
+    if current is not None:
+        edits.append(LineEdit(*current))
+    return edits
+
+
+def apply_edits(base: list, edits: list[LineEdit]) -> list:
+    """Apply LineEdits (base coordinates) to `base`; the inverse of myers_diff."""
+    result = list(base)
+    for edit in sorted(edits, key=lambda e: e.start, reverse=True):
+        result[edit.start : edit.start + edit.old_count] = edit.new_lines
+    return result
+
+
+def _bytes_to_lines(data: bytes) -> list[str] | None:
+    """Decode file bytes into lines, or None if the file looks binary."""
+    if b"\0" in data:
+        return None
+    try:
+        return split_lines(data.decode("utf-8"))
+    except UnicodeDecodeError:
+        return None
 
 
 class WorkingTree:
@@ -69,12 +206,17 @@ class WorkingTree:
 
     def stage_file(self, path) -> None:
         full_path = os.path.join(self.root, path)
-
-        if not os.path.isfile(full_path):
-            raise MiniGitError(f"No such file: {path}")
-
         rel_path = os.path.relpath(full_path, self.root)
         rel_path = rel_path.replace(os.sep, "/")
+
+        if not os.path.isfile(full_path):
+            # A tracked file that is gone from disk: staging it stages the deletion.
+            entries = self.read_index()
+            remaining = [e for e in entries if e.path != rel_path]
+            if len(remaining) == len(entries):
+                raise MiniGitError(f"No such file: {path}")
+            self.write_index(remaining)
+            return
 
         with open(full_path, "rb") as f:
             data = f.read()
@@ -134,34 +276,73 @@ class WorkingTree:
         walk(tree_hash, "")
         return sorted(entries, key=lambda e: e.path)
 
-    def diff_working_tree_vs(self, tree_hash) -> DiffResult:
-        result = DiffResult([], [], [])
-        tree_entries = self.read_tree_entries(tree_hash)
+    def _disk_mode(self, full_path: str) -> str:
+        return "100755" if os.access(full_path, os.X_OK) else "100644"
+
+    def _make_change(self, path, status, old_mode, new_mode, old_data, new_data) -> _FileChange:
+        old_lines = _bytes_to_lines(old_data)
+        new_lines = _bytes_to_lines(new_data)
+        binary = old_lines is None or new_lines is None
+        edits = [] if binary else myers_diff(old_lines, new_lines)
+        return _FileChange(
+            path=path,
+            status=status,
+            old_mode=old_mode,
+            new_mode=new_mode,
+            old_lines=[] if binary else old_lines,
+            edits=edits,
+            binary=binary,
+            content_changed=old_data != new_data,
+        )
+
+    def _compare_with_tree(self, tree_hash) -> list[_FileChange]:
+        """Compare a tree (None = empty tree) with the files on disk. Read-only."""
+        tree_entries = self.read_tree_entries(tree_hash) if tree_hash else []
         known_paths = {e.path for e in tree_entries}
+        changes = []
 
         for entry in tree_entries:
             full_path = os.path.join(self.root, entry.path)
             if not os.path.isfile(full_path):
-                result.deleted.append(entry.path)
-            else:
-                with open(full_path, "rb") as f:
-                    data = f.read()
-                current_hash = self.store.hash_object(data, "blob")
-                current_mode = "100755" if os.access(full_path, os.X_OK) else "100644"
-                if current_hash != entry.hash or current_mode != entry.mode:
-                    result.modified.append(entry.path)
+                _, old_data = self.store.read_object(entry.hash)
+                changes.append(
+                    self._make_change(entry.path, "deleted", entry.mode, None, old_data, b"")
+                )
+                continue
+            with open(full_path, "rb") as f:
+                new_data = f.read()
+            new_mode = self._disk_mode(full_path)
+            if self.store.hash_object(new_data, "blob") == entry.hash and new_mode == entry.mode:
+                continue
+            _, old_data = self.store.read_object(entry.hash)
+            changes.append(
+                self._make_change(entry.path, "modified", entry.mode, new_mode, old_data, new_data)
+            )
 
         for dirpath, dirnames, filenames in os.walk(self.root):
             dirnames[:] = [d for d in dirnames if d != ".minigit"]
             for filename in filenames:
                 full_path = os.path.join(dirpath, filename)
                 rel_path = os.path.relpath(full_path, self.root).replace(os.sep, "/")
-                if rel_path not in known_paths:
-                    result.added.append(rel_path)
+                if rel_path in known_paths:
+                    continue
+                with open(full_path, "rb") as f:
+                    new_data = f.read()
+                new_mode = self._disk_mode(full_path)
+                changes.append(self._make_change(rel_path, "added", None, new_mode, b"", new_data))
 
-        result.added.sort()
-        result.deleted.sort()
-        result.modified.sort()
+        return sorted(changes, key=lambda c: c.path)
+
+    def diff_working_tree_vs(self, tree_hash) -> DiffResult:
+        """Compare the working files with a tree (None = empty tree).
+
+        added / deleted / modified stay plain sorted path lists. line_diffs adds
+        path -> list[LineEdit] (base = the tree's version), or None for binary files.
+        """
+        result = DiffResult([], [], [])
+        for change in self._compare_with_tree(tree_hash):
+            getattr(result, change.status).append(change.path)
+            result.line_diffs[change.path] = None if change.binary else change.edits
         return result
 
     def _working_status(self) -> DiffResult:
@@ -191,9 +372,20 @@ class WorkingTree:
 
         return result
 
-    def checkout(self, tree_hash) -> None:
+    def checkout(self, tree_hash, conflicted_paths=()) -> None:
+        """Make the working files and the index match `tree_hash`.
+
+        `conflicted_paths` (used by a merge) are written to disk like every other
+        path - their blob in the tree holds the conflict markers - but their index
+        entry stays at its pre-merge version (or is left out if there was none), so
+        status reports them as "not staged" until `add` resolves them.
+        """
         target_entries = self.read_tree_entries(tree_hash)
         target_by_path = {e.path: e for e in target_entries}
+
+        conflicted = set(conflicted_paths)
+        for path in sorted(conflicted - set(target_by_path)):
+            raise MiniGitError(f"conflicted path is not in the target tree: {path}")
 
         # Reject unsafe paths
         blob_cache = {}
@@ -268,8 +460,14 @@ class WorkingTree:
                 f.write(blob_cache[entry.path])
             os.chmod(full_path, 0o755 if entry.mode == "100755" else 0o644)
 
-        # Now matched
-        self.write_index(target_entries)
+        # Now matched - except conflicted paths, which keep their pre-merge entry.
+        index_entries = []
+        for entry in target_entries:
+            if entry.path not in conflicted:
+                index_entries.append(entry)
+            elif entry.path in current_by_path:
+                index_entries.append(current_by_path[entry.path])
+        self.write_index(index_entries)
 
     def _validate_checkout_path(self, path: str) -> None:
         if (
@@ -380,6 +578,66 @@ def cmd_status(args) -> int:
     return 0
 
 
+def _hunk_range(start: int, count: int) -> str:
+    return f"{start if count == 0 else start + 1},{count}"
+
+
+def _format_change(change: _FileChange) -> list[str]:
+    """Render one file's changes as printable lines."""
+    path = change.path
+    out = [f"diff --minigit a/{path} b/{path}"]
+
+    if change.status == "added":
+        out.append(f"new file mode {change.new_mode}")
+    elif change.status == "deleted":
+        out.append(f"deleted file mode {change.old_mode}")
+    elif change.old_mode != change.new_mode:
+        out.append(f"old mode {change.old_mode}")
+        out.append(f"new mode {change.new_mode}")
+
+    if change.binary:
+        if change.content_changed:
+            out.append(f"binary file changed: {path}")
+        return out
+    if not change.edits:
+        return out  # mode-only change, or an empty file added / deleted
+
+    out.append("--- /dev/null" if change.status == "added" else f"--- a/{path}")
+    out.append("+++ /dev/null" if change.status == "deleted" else f"+++ b/{path}")
+
+    def emit(prefix: str, line: str) -> None:
+        out.append(prefix + line.removesuffix("\n"))
+        if not line.endswith("\n"):
+            out.append("\\ No newline at end of file")
+
+    offset = 0
+    for edit in change.edits:
+        new_start = edit.start + offset
+        out.append(
+            f"@@ -{_hunk_range(edit.start, edit.old_count)} "
+            f"+{_hunk_range(new_start, len(edit.new_lines))} @@"
+        )
+        for line in change.old_lines[edit.start : edit.start + edit.old_count]:
+            emit("-", line)
+        for line in edit.new_lines:
+            emit("+", line)
+        offset += len(edit.new_lines) - edit.old_count
+    return out
+
+
+def cmd_diff(args) -> int:
+    """minigit diff: HEAD tree vs the working files (unborn HEAD = empty tree)."""
+    wt = WorkingTree()
+
+    from minigit.commits import CommitManager
+
+    head_tree_hash = CommitManager(wt.root, store=wt.store, tree=wt).get_head_tree()
+    for change in wt._compare_with_tree(head_tree_hash):
+        for line in _format_change(change):
+            print(line)
+    return 0
+
+
 def register_index_commands(subparsers) -> None:
     add_parser = subparsers.add_parser("add", help="stage a file")
     add_parser.add_argument("path")
@@ -387,3 +645,6 @@ def register_index_commands(subparsers) -> None:
 
     status_parser = subparsers.add_parser("status", help="show staged files")
     status_parser.set_defaults(handler=cmd_status)
+
+    diff_parser = subparsers.add_parser("diff", help="show line changes since HEAD")
+    diff_parser.set_defaults(handler=cmd_diff)

@@ -7,6 +7,7 @@ from typing import NamedTuple
 
 import pytest
 
+from minigit.cli import main
 from minigit.commits import CommitManager
 from minigit.errors import NetworkProtocolError
 from minigit.objects import ObjectStore
@@ -326,11 +327,12 @@ def test_push_disconnect_before_done_leaves_ref_unchanged(push_pair):
 def test_push_rejects_unrelated_remote_tip(push_pair):
     pair = push_pair
     unrelated = _commit(pair.remote_store, pair.remote_commits, {"other.txt": b"x"}, [])
-    _commit(pair.local_store, pair.local_commits, {"a.txt": b"1"}, [])
+    local_tip = _commit(pair.local_store, pair.local_commits, {"a.txt": b"1"}, [])
 
-    with pytest.raises(NetworkProtocolError):
+    with pytest.raises(NetworkProtocolError, match="don't have locally - pull first"):
         pair.client.push(pair.address, "main", "tok")
     assert pair.remote_commits.read_ref("main") == unrelated
+    assert pair.local_commits.read_ref("main") == local_tip
 
 
 def test_push_rejects_ref_changed_during_transfer(push_pair):
@@ -734,3 +736,286 @@ def test_push_invalid_ref_reply_is_protocol_error(tmp_path, monkeypatch, reply):
     monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: sock)
     with pytest.raises(NetworkProtocolError, match="invalid"):
         RemoteClient(tmp_path).push("localhost:9418", "main", "tok")
+
+
+# --- push conflict detection (#34) ---
+
+
+def _second_client(tmp_path, pair: PushPair) -> RemoteClient:
+    """Another independent local repo, pointed at the same remote as `pair.client`."""
+
+    root = tmp_path / "local2"
+    root.mkdir()
+    store = ObjectStore(str(root))
+    return RemoteClient(
+        repo_path=str(root), store=store, commits=CommitManager(str(root), store=store)
+    )
+
+
+def _count_puts(monkeypatch) -> list:
+    """Record every object `RemoteClient` uploads, while still uploading it."""
+
+    calls = []
+    original_put = RemoteClient._put_object
+
+    def counting_put(self, sock, buf, obj_hash):
+        calls.append(obj_hash)
+        return original_put(self, sock, buf, obj_hash)
+
+    monkeypatch.setattr(RemoteClient, "_put_object", counting_put)
+    return calls
+
+
+def _open_push(pair: PushPair, old: str, new: str) -> tuple[socket.socket, bytearray]:
+    """Authenticate a raw connection and send `PUSH main <old> <new>`; returns the reply buffer."""
+
+    sock = socket.create_connection(("127.0.0.1", pair.server.port), timeout=5)
+    buf = bytearray()
+    send_line(sock, "AUTH tok")
+    assert receive_line(sock, buf) == "OK"
+    send_line(sock, f"PUSH main {old} {new}")
+    return sock, buf
+
+
+def _upload(sock, buf: bytearray, store: ObjectStore, hashes) -> None:
+    """Raw-protocol HAVE/PUT for each hash, uploading whatever the remote is missing."""
+
+    for obj_hash in hashes:
+        send_line(sock, f"HAVE {obj_hash}")
+        if receive_line(sock, buf) == "NO":
+            obj_type, content = store.read_object(obj_hash)
+            send_line(sock, f"PUT {obj_hash}")
+            send_line(sock, f"OBJ {obj_type} {len(content)}")
+            sock.sendall(content)
+            assert receive_line(sock, buf) == "OK"
+
+
+def test_push_fast_forward_then_repeat_transfers_nothing(push_pair, monkeypatch, capsys):
+    pair = push_pair
+    c1 = _commit(pair.local_store, pair.local_commits, {"a.txt": b"1"}, [])
+    pair.client.push(pair.address, "main", "tok")
+    c2 = _commit(pair.local_store, pair.local_commits, {"a.txt": b"2"}, [c1])
+    pair.client.push(pair.address, "main", "tok")
+    assert pair.remote_commits.read_ref("main") == c2
+
+    puts = _count_puts(monkeypatch)
+    capsys.readouterr()
+    pair.client.push(pair.address, "main", "tok")
+    assert puts == []
+    assert "up to date" in capsys.readouterr().out
+    assert pair.remote_commits.read_ref("main") == c2
+
+
+def test_push_accepts_ancestor_only_via_second_merge_parent(push_pair):
+    pair = push_pair
+    remote_tip = _commit(pair.local_store, pair.local_commits, {"a.txt": b"a"}, [])
+    pair.client.push(pair.address, "main", "tok")
+
+    # `other` is an unrelated root, so the remote tip is reachable only through
+    # the merge commit's *second* parent - a first-parent-only walk would miss it.
+    other = _commit(pair.local_store, pair.local_commits, {"b.txt": b"b"}, [])
+    merge = _commit(
+        pair.local_store, pair.local_commits, {"a.txt": b"a", "b.txt": b"b"}, [other, remote_tip]
+    )
+
+    pair.client.push(pair.address, "main", "tok")
+    assert pair.remote_commits.read_ref("main") == merge
+    assert set(pair.remote_commits.walk_history(merge)) == {merge, other, remote_tip}
+
+
+def test_push_rejects_remote_ahead(push_pair):
+    pair = push_pair
+    c1 = _commit(pair.local_store, pair.local_commits, {"a.txt": b"1"}, [])
+    c2 = _commit(pair.local_store, pair.local_commits, {"a.txt": b"2"}, [c1])
+    pair.client.push(pair.address, "main", "tok")
+    pair.local_commits.write_ref("main", c1)  # local falls behind a remote it has seen
+
+    with pytest.raises(NetworkProtocolError, match="ahead of local - pull first"):
+        pair.client.push(pair.address, "main", "tok")
+    assert pair.remote_commits.read_ref("main") == c2
+    assert pair.local_commits.read_ref("main") == c1
+
+
+def test_push_rejects_diverged(push_pair):
+    pair = push_pair
+    base = _commit(pair.local_store, pair.local_commits, {"a.txt": b"base"}, [])
+    theirs = _commit(pair.local_store, pair.local_commits, {"a.txt": b"theirs"}, [base])
+    pair.client.push(pair.address, "main", "tok")
+    ours = _commit(pair.local_store, pair.local_commits, {"a.txt": b"ours"}, [base])
+
+    with pytest.raises(NetworkProtocolError, match="diverged - pull and merge first"):
+        pair.client.push(pair.address, "main", "tok")
+    assert pair.remote_commits.read_ref("main") == theirs
+    assert pair.local_commits.read_ref("main") == ours
+
+
+def test_two_stale_clients_second_rejected(tmp_path, push_pair):
+    """Week 5 checkpoint: two repos share a remote tip, commit independently, push both."""
+
+    pair = push_pair
+    alice = pair.client
+    bob = _second_client(tmp_path, pair)
+
+    base = _commit(pair.local_store, pair.local_commits, {"a.txt": b"base"}, [])
+    alice.push(pair.address, "main", "tok")
+    bob.fetch_objects(pair.address, sorted(alice.collect_reachable("main")), "tok")
+    bob.commits.write_ref("main", base)
+
+    alice_tip = _commit(pair.local_store, pair.local_commits, {"a.txt": b"alice"}, [base])
+    bob_tip = _commit(bob.store, bob.commits, {"a.txt": b"bob"}, [base])
+
+    alice.push(pair.address, "main", "tok")
+    with pytest.raises(NetworkProtocolError, match="pull first"):
+        bob.push(pair.address, "main", "tok")
+
+    assert pair.remote_commits.read_ref("main") == alice_tip
+    assert bob.commits.read_ref("main") == bob_tip
+
+
+def test_stale_push_rejected_by_server(push_pair):
+    """A client that skips its own ancestry check still can't overwrite a moved ref."""
+
+    pair = push_pair
+    base = _commit(pair.local_store, pair.local_commits, {"a.txt": b"base"}, [])
+    pair.client.push(pair.address, "main", "tok")
+    moved = _commit(pair.remote_store, pair.remote_commits, {"a.txt": b"moved"}, [base])
+    stale = _commit(pair.local_store, pair.local_commits, {"a.txt": b"stale"}, [base])
+
+    sock, buf = _open_push(pair, base, stale)
+    try:
+        reply = receive_line(sock, buf)
+    finally:
+        sock.close()
+
+    assert reply == "ERR remote main has moved since you last synced - pull first"
+    assert pair.remote_commits.read_ref("main") == moved
+
+
+def test_push_rejects_existing_ref_moved_during_transfer(push_pair):
+    pair = push_pair
+    base = _commit(pair.local_store, pair.local_commits, {"a.txt": b"base"}, [])
+    pair.client.push(pair.address, "main", "tok")
+    new = _commit(pair.local_store, pair.local_commits, {"a.txt": b"new"}, [base])
+
+    sock, buf = _open_push(pair, base, new)
+    try:
+        assert receive_line(sock, buf) == "OK"
+        pair.remote_commits.write_ref("main", "b" * 40)  # another push lands mid-transfer
+        _upload(sock, buf, pair.local_store, sorted(pair.client.collect_reachable("main")))
+        send_line(sock, "DONE")
+        assert receive_line(sock, buf) == "ERR remote main changed during push - pull first"
+    finally:
+        sock.close()
+
+    assert pair.remote_commits.read_ref("main") == "b" * 40
+
+
+def test_direct_push_not_fast_forward(push_pair):
+    pair = push_pair
+    base = _commit(pair.local_store, pair.local_commits, {"a.txt": b"base"}, [])
+    pair.client.push(pair.address, "main", "tok")
+    unrelated = _commit(pair.local_store, pair.local_commits, {"b.txt": b"other"}, [])
+
+    sock, buf = _open_push(pair, base, unrelated)
+    try:
+        assert receive_line(sock, buf) == "OK"
+        _upload(sock, buf, pair.local_store, sorted(pair.client.collect_reachable("main")))
+        send_line(sock, "DONE")
+        assert receive_line(sock, buf) == "ERR not a fast-forward"
+    finally:
+        sock.close()
+
+    assert pair.remote_commits.read_ref("main") == base
+
+
+def test_direct_push_missing_objects(push_pair):
+    pair = push_pair
+    tip = _commit(pair.local_store, pair.local_commits, {"a.txt": b"1"}, [])
+
+    sock, buf = _open_push(pair, "-", tip)
+    try:
+        assert receive_line(sock, buf) == "OK"
+        send_line(sock, "DONE")  # claims done without uploading anything
+        assert receive_line(sock, buf).startswith("ERR incomplete history")
+    finally:
+        sock.close()
+
+    assert pair.remote_commits.read_ref("main") is None
+
+
+@pytest.mark.parametrize("old", ["zzz", "A" * 40, "a" * 39])
+def test_direct_push_invalid_old_hash(push_pair, old):
+    pair = push_pair
+    tip = _commit(pair.local_store, pair.local_commits, {"a.txt": b"1"}, [])
+
+    sock, buf = _open_push(pair, old, tip)
+    try:
+        assert receive_line(sock, buf) == "ERR invalid old hash"
+    finally:
+        sock.close()
+
+    assert pair.remote_commits.read_ref("main") is None
+
+
+def test_retry_after_disconnect_reuses_objects(push_pair, monkeypatch):
+    pair = push_pair
+    tip = _commit(
+        pair.local_store,
+        pair.local_commits,
+        {"a.txt": b"1", "b.txt": b"2", "dir/c.txt": b"3"},
+        [],
+    )
+    objects = sorted(pair.client.collect_reachable("main"))
+
+    sock, buf = _open_push(pair, "-", tip)
+    try:
+        assert receive_line(sock, buf) == "OK"
+        _upload(sock, buf, pair.local_store, objects[:2])
+    finally:
+        sock.close()  # drop the connection before DONE
+    assert pair.remote_commits.read_ref("main") is None
+
+    puts = _count_puts(monkeypatch)
+    pair.client.push(pair.address, "main", "tok")
+    assert pair.remote_commits.read_ref("main") == tip
+    assert sorted(puts) == objects[2:]
+
+
+def test_stalled_client_does_not_block_server(tmp_path):
+    server = RemoteServer(repo_path=str(tmp_path), token="tok", port=0, conn_timeout=0.5)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    stalled = socket.create_connection(("127.0.0.1", server.port), timeout=5)
+    try:
+        buf = bytearray()
+        send_line(stalled, "AUTH tok")
+        assert receive_line(stalled, buf) == "OK"
+        send_line(stalled, f"PUSH main - {'a' * 40}")
+        assert receive_line(stalled, buf) == "OK"
+        # ...and then goes silent mid-session, holding the serial server.
+
+        with socket.create_connection(("127.0.0.1", server.port), timeout=3) as sock:
+            buf = bytearray()
+            send_line(sock, "AUTH tok")
+            assert receive_line(sock, buf) == "OK"
+            send_line(sock, "REF main")
+            assert receive_line(sock, buf) == "REF main -"
+            send_line(sock, "DONE")
+    finally:
+        stalled.close()
+        server.close()
+        thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+def test_cli_push_rejection_shows_reason(push_pair, monkeypatch, capsys):
+    pair = push_pair
+    _commit(pair.remote_store, pair.remote_commits, {"other.txt": b"x"}, [])
+    _commit(pair.local_store, pair.local_commits, {"a.txt": b"1"}, [])
+    monkeypatch.chdir(pair.client.repo_path)
+
+    assert main(["push", pair.address, "main", "--token", "tok"]) == 1
+    err = capsys.readouterr().err
+    assert "push rejected" in err
+    assert "pull first" in err
+    assert "tok" not in err

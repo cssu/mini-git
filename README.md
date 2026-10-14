@@ -74,6 +74,68 @@ reports that the branch is up to date. Use a disposable token for this local dem
 Pull remains a handshake placeholder; fetching and restoring a branch through
 `minigit pull` is not implemented yet.
 
+## Status and diff
+
+`minigit status` prints the current branch, then up to three sections. Empty
+sections are left out, paths are sorted, and a repository with nothing to report
+prints `clean`. Before the first commit it also prints `no commits yet`.
+
+- **staged**: the HEAD commit's tree compared with the index.
+- **not staged**: the index compared with the files in the working directory.
+- **untracked**: files on disk that are not in the index.
+
+A file that was staged and then edited again appears in both `staged` and
+`not staged`. `minigit diff` compares the HEAD tree with the working files (an
+empty snapshot when there are no commits yet). Both commands only read: they
+never change files, the index, or any ref, and their output is plain text, so it
+is safe to redirect to a file.
+
+```
+$ minigit status
+On branch main
+staged:
+  notes.txt
+not staged:
+  notes.txt
+untracked:
+  todo.md
+
+$ minigit diff
+diff --minigit a/notes.txt b/notes.txt
+--- a/notes.txt
++++ b/notes.txt
+@@ -1,7 +1,9 @@
+ one
+-two
++TWO
+ three
+ four
+ five
+ six
+ seven
++eight
++nine
+diff --minigit a/todo.md b/todo.md
+new file mode 100644
+--- /dev/null
++++ b/todo.md
+@@ -0,0 +1,1 @@
++x
+```
+
+A hunk header reads `@@ -<old start>,<old count> +<new start>,<new count> @@`. The
+old numbers refer to the HEAD version and the new numbers to the working file.
+Lines are numbered from 1, and an empty range is written as the line before it,
+so a new file starts at `-0,0`. Each hunk shows 3 unchanged lines around the
+changes, and edits that are close together share one hunk. A line starting with
+a space is unchanged, `-` was removed, and `+` was added. Added and deleted
+files, mode changes, and a missing final newline are all shown, and binary files
+get a one-line summary.
+
+Paths with spaces or Unicode print as they are. A path containing a control
+character or a backslash prints as a quoted, escaped string. `add` refuses file
+names that contain a tab or a newline.
+
 ## Layout
 
 ```

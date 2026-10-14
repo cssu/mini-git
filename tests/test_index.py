@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import os
 import random
+import re
 import shutil
 import sys
 import types
@@ -20,10 +21,13 @@ from minigit.index import (
     cmd_add,
     cmd_diff,
     cmd_status,
+    display_path,
     myers_diff,
     split_lines,
 )
 from minigit.objects import ObjectStore, TreeEntry
+
+BRANCH = "On branch main\n"  # first line of `minigit status` on the default branch
 
 
 def test_build_tree_empty_index(tmp_path):
@@ -209,7 +213,7 @@ def test_status_clean_after_commit(tmp_path, monkeypatch, capsys):
     cmd_status(_Args())
 
     output = capsys.readouterr().out
-    assert output.strip() == "clean"
+    assert output == BRANCH + "clean\n"
 
 
 def test_status_staged_and_unstaged_on_one_file(tmp_path, monkeypatch, capsys):
@@ -266,7 +270,7 @@ def test_status_and_diff_do_not_store_unstaged_content(tmp_path, monkeypatch, ca
     file.write_text("unstaged")
     monkeypatch.chdir(tmp_path)
     cmd_status(_Args())
-    assert capsys.readouterr().out == "not staged:\n  file\n"
+    assert capsys.readouterr().out == BRANCH + "not staged:\n  file\n"
     assert wt.diff_working_tree_vs(tree).modified == ["file"]
     assert set(wt.store.objects_dir.rglob("*")) == before
 
@@ -279,7 +283,7 @@ def test_status_reports_file_removed_from_index_as_untracked(tmp_path, monkeypat
     wt.write_index([])
     monkeypatch.chdir(tmp_path)
     cmd_status(_Args())
-    assert capsys.readouterr().out == "staged:\n  file\nuntracked:\n  file\n"
+    assert capsys.readouterr().out == BRANCH + "staged:\n  file\nuntracked:\n  file\n"
 
 
 def test_checkout_restores_changed_file(tmp_path):
@@ -681,6 +685,9 @@ def cli_repo(tmp_path, monkeypatch):
         def get_head_tree(self):
             return state["head_tree"]
 
+        def read_head(self):
+            return None
+
     fake = types.ModuleType("minigit.commits")
     fake.CommitManager = FakeCommitManager
     monkeypatch.setitem(sys.modules, "minigit.commits", fake)
@@ -715,10 +722,8 @@ def test_cli_shows_headers_and_added_removed_lines(cli_repo, capsys):
     assert "diff --minigit a/a.txt b/a.txt" in out
     assert "--- a/a.txt" in out
     assert "+++ b/a.txt" in out
-    assert "@@ -2,1 +2,1 @@" in out
-    assert "-two" in out
-    assert "+TWO" in out
-    assert " one" not in out
+    assert "@@ -1,3 +1,3 @@" in out
+    assert out[out.index("@@ -1,3 +1,3 @@") + 1 :] == [" one", "-two", "+TWO", " three"]
 
 
 def test_cli_removed_lines_come_from_the_old_text(cli_repo, capsys):
@@ -732,7 +737,7 @@ def test_cli_removed_lines_come_from_the_old_text(cli_repo, capsys):
     assert out.index("-old1") < out.index("-old2") < out.index("+new")
 
 
-def test_cli_second_hunk_line_numbers_account_for_earlier_edits(cli_repo, capsys):
+def test_cli_nearby_edits_share_one_hunk(cli_repo, capsys):
     repo, commit = cli_repo
     write(repo, "a.txt", "a\nb\nc\nd\ne\nf\n")
     commit("a.txt")
@@ -740,8 +745,23 @@ def test_cli_second_hunk_line_numbers_account_for_earlier_edits(cli_repo, capsys
 
     out = run_diff(capsys).splitlines()
 
-    assert "@@ -1,0 +2,2 @@" in out
-    assert "@@ -6,1 +8,1 @@" in out
+    assert [line for line in out if line.startswith("@@")] == ["@@ -1,6 +1,8 @@"]
+
+
+def test_cli_distant_edits_are_separate_hunks_with_shifted_numbers(cli_repo, capsys):
+    repo, commit = cli_repo
+    old = "".join(f"{i}\n" for i in range(1, 21))
+    new = "1\nTWO\n" + "".join(f"{i}\n" for i in range(3, 19)) + "TWENTY\n"
+    write(repo, "a.txt", old)
+    commit("a.txt")
+    write(repo, "a.txt", new)
+
+    out = run_diff(capsys).splitlines()
+
+    assert [line for line in out if line.startswith("@@")] == [
+        "@@ -1,5 +1,5 @@",
+        "@@ -16,5 +16,4 @@",
+    ]
 
 
 def test_cli_new_and_deleted_files(cli_repo, capsys):
@@ -840,7 +860,15 @@ def test_status_sections_still_staged_not_staged_untracked(cli_repo, capsys):
     cmd_status(None)
     out = capsys.readouterr().out.splitlines()
 
-    assert out == ["staged:", "  b.txt", "not staged:", "  a.txt", "untracked:", "  c.txt"]
+    assert out == [
+        "On branch main",
+        "staged:",
+        "  b.txt",
+        "not staged:",
+        "  a.txt",
+        "untracked:",
+        "  c.txt",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1018,7 +1046,7 @@ def test_fast_forward_into_fresh_repo_restores_everything(source, local, monkeyp
     assert [e.path for e in local.wt.read_index()] == sorted(e.path for e in source.wt.read_index())
     assert local.cm._current_branch() == "main"
     assert local.cm.read_ref("main") == source.cm.read_ref("main")
-    assert status_text(local, monkeypatch, capsys) == "clean\n"
+    assert status_text(local, monkeypatch, capsys) == BRANCH + "clean\n"
     assert diff_text(local, monkeypatch, capsys) == ""
 
 
@@ -1044,7 +1072,7 @@ def test_second_fast_forward_applies_edit_delete_new_dir_and_mode(
     assert local.read("docs/guide/intro.md") == b"intro\n"
     assert not os.access(local.path("run.sh"), os.X_OK)
     assert local.cm._current_branch() == "main"
-    assert status_text(local, monkeypatch, capsys) == "clean\n"
+    assert status_text(local, monkeypatch, capsys) == BRANCH + "clean\n"
     assert diff_text(local, monkeypatch, capsys) == ""
 
 
@@ -1071,7 +1099,9 @@ def test_dirty_tracked_file_blocks_pull_and_is_kept(synced):
     local.write("README.md", "my local edit\n")
     before = local.snapshot()
 
-    with pytest.raises(MiniGitError):
+    with pytest.raises(
+        MiniGitError, match="local changes would be lost: README.md; commit or undo your edits"
+    ):
         local.cm.merge("theirs")
 
     assert local.snapshot() == before
@@ -1184,7 +1214,10 @@ def test_conflicted_path_gets_markers_but_keeps_pre_merge_index_entry(merging, m
     index = {e.path: e for e in local.wt.read_index()}
     assert index["a.txt"] == old_a
     assert index["c.txt"].hash == hashlib.sha1(b"blob 16\0added by theirs\n").hexdigest()
-    assert status_text(local, monkeypatch, capsys) == "staged:\n  c.txt\nnot staged:\n  a.txt\n"
+    assert (
+        status_text(local, monkeypatch, capsys)
+        == BRANCH + "staged:\n  c.txt\nnot staged:\n  a.txt\n"
+    )
 
 
 def test_conflicted_checkout_of_unknown_path_is_refused_before_any_write(merging):
@@ -1209,13 +1242,13 @@ def test_resolve_with_add_then_commit_is_clean_across_fresh_objects(merging, mon
     assert cmd_add(argparse.Namespace(path="a.txt")) == 0
 
     fresh = Repo(local.root)
-    assert status_text(fresh, monkeypatch, capsys) == "staged:\n  a.txt\n  c.txt\n"
+    assert status_text(fresh, monkeypatch, capsys) == BRANCH + "staged:\n  a.txt\n  c.txt\n"
 
     fresh = Repo(local.root)
     fresh.commit("merge", extra_parents=[theirs_tip])
 
     fresh = Repo(local.root)
-    assert status_text(fresh, monkeypatch, capsys) == "clean\n"
+    assert status_text(fresh, monkeypatch, capsys) == BRANCH + "clean\n"
     assert fresh.read("a.txt") == b"resolved by hand\n"
     assert len(fresh.cm.read_commit(fresh.cm.read_ref("main")).parents) == 2
 
@@ -1230,13 +1263,247 @@ def test_resolved_deletion_with_add_then_commit(merging, monkeypatch, capsys):
 
     fresh = Repo(local.root)
     assert [e.path for e in fresh.wt.read_index()] == ["b.txt", "c.txt"]
-    assert status_text(fresh, monkeypatch, capsys) == "staged:\n  a.txt\n  c.txt\n"
+    assert status_text(fresh, monkeypatch, capsys) == BRANCH + "staged:\n  a.txt\n  c.txt\n"
     fresh.commit("merge: delete a.txt")
     fresh = Repo(local.root)
-    assert status_text(fresh, monkeypatch, capsys) == "clean\n"
+    assert status_text(fresh, monkeypatch, capsys) == BRANCH + "clean\n"
     assert not fresh.exists("a.txt")
 
 
 def test_add_of_a_missing_untracked_path_still_fails(local):
     with pytest.raises(MiniGitError, match="No such file"):
         local.wt.stage_file("never-existed.txt")
+
+
+# ---------------------------------------------------------------------------
+# Week 7: status / diff output, path display, error messages
+# ---------------------------------------------------------------------------
+
+
+def run_status(capsys):
+    assert cmd_status(None) == 0
+    return capsys.readouterr().out
+
+
+def test_status_empty_unborn_repo(cli_repo, capsys):
+    assert run_status(capsys) == BRANCH + "no commits yet\nclean\n"
+
+
+def test_status_unborn_repo_lists_staged_files(cli_repo, capsys):
+    repo, _ = cli_repo
+    write(repo, "a.txt", "hi\n")
+    repo.stage_file("a.txt")
+
+    assert run_status(capsys) == BRANCH + "no commits yet\nstaged:\n  a.txt\n"
+
+
+def test_status_staged_then_edited_file_is_in_both_sections(cli_repo, capsys):
+    repo, commit = cli_repo
+    write(repo, "a.txt", "v1\n")
+    commit("a.txt")
+    write(repo, "a.txt", "v2\n")
+    repo.stage_file("a.txt")
+    write(repo, "a.txt", "v3\n")
+
+    assert run_status(capsys) == BRANCH + "staged:\n  a.txt\nnot staged:\n  a.txt\n"
+
+
+def test_status_paths_are_sorted_and_handle_nesting_spaces_and_unicode(cli_repo, capsys):
+    repo, _ = cli_repo
+    for name in ["z.txt", "dir/sub/b file.txt", "café/é.txt", "a.txt"]:
+        write(repo, name, "x\n")
+
+    expected = ["a.txt", "café/é.txt", "dir/sub/b file.txt", "z.txt"]
+    assert run_status(capsys) == (
+        BRANCH + "no commits yet\nuntracked:\n" + "".join(f"  {p}\n" for p in expected)
+    )
+
+
+def test_display_path_escapes_only_unprintable_paths():
+    assert display_path("my dir/café é.txt") == "my dir/café é.txt"
+    assert display_path("a\nb.txt") == '"a\\nb.txt"'
+    assert display_path("a\\b.txt") == '"a\\\\b.txt"'
+    assert display_path("x.txt", "a/") == "a/x.txt"
+    assert display_path("x\ty.txt", "a/") == '"a/x\\ty.txt"'
+
+
+def test_status_first_line_names_the_branch_or_detached_head(tmp_path, monkeypatch, capsys):
+    (tmp_path / "f.txt").write_text("x")
+    wt = WorkingTree(tmp_path)
+    wt.stage_file("f.txt")
+    manager = CommitManager(tmp_path)
+    commit = manager.create_commit(wt.build_tree_from_index(), [], "Test", "initial")
+    monkeypatch.chdir(tmp_path)
+
+    manager.write_head("feature")
+    assert run_status(capsys).splitlines()[0] == "On branch feature"
+
+    (tmp_path / ".minigit" / "HEAD").write_text(commit + "\n")
+    assert run_status(capsys).splitlines()[0] == f"HEAD detached at {commit[:7]}"
+
+
+def test_status_lists_unresolved_merge_paths_from_the_manager(cli_repo, capsys, monkeypatch):
+    repo, _ = cli_repo
+    write(repo, "a.txt", "x\n")
+    monkeypatch.setattr(
+        sys.modules["minigit.commits"].CommitManager,
+        "unresolved_merge_paths",
+        lambda self: ["a.txt"],
+        raising=False,
+    )
+
+    assert run_status(capsys) == (
+        BRANCH + "no commits yet\nunresolved (merge conflict):\n  a.txt\nuntracked:\n  a.txt\n"
+    )
+
+
+def apply_printed_hunks(old_lines, diff_lines):
+    """Apply the printed hunks to old_lines (all lines end in "\\n") - checks the numbers."""
+    result, pos, hunks = [], 0, []
+    for line in diff_lines:
+        if line.startswith("@@"):
+            hunks.append((re.fullmatch(r"@@ -(\d+),(\d+) \+(\d+),(\d+) @@", line).groups(), []))
+        elif hunks:
+            hunks[-1][1].append(line)
+    for (old_start, old_count, new_start, new_count), body in hunks:
+        old_start, old_count, new_start, new_count = map(
+            int, (old_start, old_count, new_start, new_count)
+        )
+        first_old = old_start if old_count == 0 else old_start - 1
+        result += old_lines[pos:first_old]
+        pos = first_old
+        assert len(result) == (new_start if new_count == 0 else new_start - 1)
+        seen_old = seen_new = 0
+        for line in body:
+            text = line[1:] + "\n"
+            if line[0] in " -":
+                assert old_lines[pos] == text
+                pos += 1
+                seen_old += 1
+            if line[0] in " +":
+                result.append(text)
+                seen_new += 1
+        assert (seen_old, seen_new) == (old_count, new_count)
+    return result + old_lines[pos:]
+
+
+def test_printed_hunks_rebuild_the_new_file_for_any_context_size(repo):
+    from minigit.index import _format_change
+
+    random.seed(3)
+    for _ in range(300):
+        old = [random.choice("abc") + "\n" for _ in range(random.randint(0, 14))]
+        new = [random.choice("abc") + "\n" for _ in range(random.randint(0, 14))]
+        change = repo._make_change(
+            "f.txt", "modified", "100644", "100644", "".join(old).encode(), "".join(new).encode()
+        )
+        for context in (0, 1, 3):
+            printed = _format_change(change, context)
+            assert apply_printed_hunks(old, printed) == new
+
+
+def test_cli_empty_and_repeated_line_files(cli_repo, capsys):
+    repo, commit = cli_repo
+    write(repo, "rep.txt", "x\nx\nx\n")
+    commit("rep.txt")
+    write(repo, "rep.txt", "x\nx\n")
+    write(repo, "empty.txt", "")
+
+    out = run_diff(capsys).splitlines()
+
+    assert "diff --minigit a/empty.txt b/empty.txt" in out
+    assert "new file mode 100644" in out
+    assert [line for line in out if line.startswith("@@")] == ["@@ -1,3 +1,2 @@"]
+    assert out.count("-x") == 1
+
+
+def test_cli_binary_files_added_and_deleted_get_a_summary(cli_repo, capsys):
+    repo, commit = cli_repo
+    write(repo, "gone.bin", b"\x00\x01")
+    commit("gone.bin")
+    os.remove("gone.bin")
+    write(repo, "new.bin", b"\x00\x02")
+
+    out = run_diff(capsys).splitlines()
+
+    assert "binary file deleted: gone.bin" in out
+    assert "binary file added: new.bin" in out
+    assert not any(line.startswith("@@") for line in out)
+
+
+def test_cli_diff_shows_space_unicode_and_odd_paths_clearly(cli_repo, capsys):
+    repo, commit = cli_repo
+    write(repo, "my dir/café notes.txt", "one\n")
+    commit("my dir/café notes.txt")
+    write(repo, "my dir/café notes.txt", "two\n")
+    write(repo, "odd\nname.txt", "new\n")  # cannot be staged, but it can sit in the folder
+
+    out = run_diff(capsys).splitlines()
+    status = run_status(capsys)
+
+    assert "diff --minigit a/my dir/café notes.txt b/my dir/café notes.txt" in out
+    assert "--- a/my dir/café notes.txt" in out
+    assert '+++ "b/odd\\nname.txt"' in out
+    assert not any(line == "name.txt" for line in out)
+    assert '  "odd\\nname.txt"\n' in status
+
+
+def test_cli_diff_output_is_plain_and_repeatable(cli_repo, capsys):
+    repo, commit = cli_repo
+    write(repo, "a.txt", "one\n")
+    commit("a.txt")
+    write(repo, "a.txt", "two\n")
+
+    first = run_diff(capsys)
+
+    assert first == run_diff(capsys)
+    assert "\x1b" not in first
+
+
+def test_diff_help_says_head_tree_versus_working_files(monkeypatch):
+    from minigit.index import register_index_commands
+
+    monkeypatch.setenv("COLUMNS", "200")
+    parser = argparse.ArgumentParser()
+    register_index_commands(parser.add_subparsers())
+
+    assert "the HEAD tree compared with the working files" in parser.format_help()
+
+
+def test_status_and_diff_leave_an_unborn_repo_unchanged(local, monkeypatch, capsys):
+    local.write("a.txt", "x\n")
+    before, objects = local.snapshot(), local.object_files()
+
+    status_text(local, monkeypatch, capsys)
+    diff_text(local, monkeypatch, capsys)
+
+    assert local.snapshot() == before
+    assert local.object_files() == objects
+
+
+def test_status_and_diff_leave_a_conflicted_repo_unchanged(merging, monkeypatch, capsys):
+    local, merged_tree = merging
+    local.wt.checkout(merged_tree, conflicted_paths={"a.txt"})
+    before, objects = local.snapshot(), local.object_files()
+
+    status_text(local, monkeypatch, capsys)
+    out = diff_text(local, monkeypatch, capsys)
+
+    assert "<<<<<<< ours" in out
+    assert local.snapshot() == before
+    assert local.object_files() == objects
+
+
+def test_expected_failures_name_the_path_and_the_next_step(repo):
+    with pytest.raises(MiniGitError, match=r"No such file: nope\.txt; check the path"):
+        repo.stage_file("nope.txt")
+    with pytest.raises(MiniGitError, match=r"cannot stage \.\./x\.txt: .*outside the repository"):
+        repo.stage_file("../x.txt")
+    write(repo, "odd\nname.txt", "x\n")
+    with pytest.raises(MiniGitError, match=r'cannot stage "odd\\nname.txt": names with a tab'):
+        repo.stage_file("odd\nname.txt")
+    os.makedirs(os.path.dirname(repo.index_path))
+    with open(repo.index_path, "w") as f:
+        f.write("garbage\n")
+    with pytest.raises(MiniGitError, match=r"corrupt index: line 1 .*minigit add"):
+        repo.read_index()

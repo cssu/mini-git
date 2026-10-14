@@ -1,7 +1,7 @@
 """Module 2 - Index and working tree.
 
 Owns the bridge between live files on disk and the immutable object store:
-the index file, staging, diffing, and checkout.
+the index file, staging, diffing, checkout, and the text `status` and `diff` print.
 
 Depends on: module 1.
 Serves: module 3.
@@ -9,6 +9,7 @@ Serves: module 3.
 Build the `WorkingTree` class here, per the interface contract.
 """
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -184,11 +185,17 @@ class WorkingTree:
 
         entries = []
         with open(self.index_path, encoding="utf-8") as f:
-            for line in f:
+            for number, line in enumerate(f, start=1):
                 line = line.rstrip("\n")
                 if not line:
                     continue
-                mode, hash_, path = line.split(" ", 2)
+                try:
+                    mode, hash_, path = line.split(" ", 2)
+                except ValueError:
+                    raise MiniGitError(
+                        f"corrupt index: line {number} is not '<mode> <hash> <path>'; "
+                        "delete .minigit/index and run 'minigit add' again"
+                    ) from None
                 entries.append(IndexEntry(mode, hash_, path))
 
         return sorted(entries, key=lambda e: e.path)
@@ -209,12 +216,26 @@ class WorkingTree:
         rel_path = os.path.relpath(full_path, self.root)
         rel_path = rel_path.replace(os.sep, "/")
 
+        if rel_path == ".." or rel_path.startswith("../") or rel_path.split("/")[0] == ".minigit":
+            raise MiniGitError(
+                f"cannot stage {path}: it is outside the repository or inside .minigit; "
+                "give a path to a file in the working tree"
+            )
+
+        if any(char in rel_path for char in "\0\t\r\n"):
+            raise MiniGitError(
+                f"cannot stage {display_path(path)}: names with a tab or newline are not "
+                "supported; rename the file"
+            )
+
         if not os.path.isfile(full_path):
             # A tracked file that is gone from disk: staging it stages the deletion.
             entries = self.read_index()
             remaining = [e for e in entries if e.path != rel_path]
             if len(remaining) == len(entries):
-                raise MiniGitError(f"No such file: {path}")
+                raise MiniGitError(
+                    f"No such file: {path}; check the path, or run 'minigit status' to list files"
+                )
             self.write_index(remaining)
             return
 
@@ -404,13 +425,18 @@ class WorkingTree:
             self._validate_checkout_path(entry.path)
             full_path = os.path.join(self.root, entry.path)
             if not os.path.isfile(full_path):
-                raise MiniGitError(f"local changes would be lost: {entry.path} is missing")
+                raise MiniGitError(
+                    f"local changes would be lost: {entry.path} is missing; "
+                    "restore the file or commit its deletion first"
+                )
             with open(full_path, "rb") as f:
                 data = f.read()
             disk_hash = self.store.hash_object(data, "blob")
             disk_mode = "100755" if os.access(full_path, os.X_OK) else "100644"
             if disk_hash != entry.hash or disk_mode != entry.mode:
-                raise MiniGitError(f"local changes would be lost: {entry.path}")
+                raise MiniGitError(
+                    f"local changes would be lost: {entry.path}; commit or undo your edits first"
+                )
 
         # Preflight every parent and destination before deleting any tracked file.
         # Directories may become files only when all their contents are tracked.
@@ -429,20 +455,31 @@ class WorkingTree:
                 full_parent = os.path.join(self.root, parent)
                 if os.path.lexists(full_parent) and not os.path.isdir(full_parent):
                     if parent not in removable:
-                        raise MiniGitError(f"untracked path would be overwritten: {parent}")
+                        raise MiniGitError(
+                            f"untracked path would be overwritten: {parent}; "
+                            "move or delete it first"
+                        )
 
             full_path = os.path.join(self.root, entry.path)
             if os.path.isdir(full_path):
                 if entry.path not in tracked_dirs:
-                    raise MiniGitError(f"untracked path would be overwritten: {entry.path}")
+                    raise MiniGitError(
+                        f"untracked path would be overwritten: {entry.path}; "
+                        "move or delete it first"
+                    )
                 for directory, dirnames, filenames in os.walk(full_path):
                     for name in dirnames + filenames:
                         child = os.path.join(directory, name)
                         relative = os.path.relpath(child, self.root).replace(os.sep, "/")
                         if os.path.islink(child) or relative not in removable | tracked_dirs:
-                            raise MiniGitError(f"untracked path would be overwritten: {relative}")
+                            raise MiniGitError(
+                                f"untracked path would be overwritten: {relative}; "
+                                "move or delete it first"
+                            )
             elif os.path.lexists(full_path) and entry.path not in current_by_path:
-                raise MiniGitError(f"untracked path would be overwritten: {entry.path}")
+                raise MiniGitError(
+                    f"untracked path would be overwritten: {entry.path}; move or delete it first"
+                )
 
         # Remove tracked files the target doesn't have, then prune
         for entry in current_entries:
@@ -502,14 +539,77 @@ def cmd_add(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Output formatting for `status` and `diff` (plain text; no Myers code in here)
+# ---------------------------------------------------------------------------
+
+CONTEXT_LINES = 3  # unchanged lines shown around each change in a diff hunk
+
+
+def display_path(path: str, prefix: str = "") -> str:
+    """Return `prefix + path` the way status and diff print it.
+
+    Ordinary paths (spaces and Unicode included) are printed as they are. A path with
+    a control character or a backslash is printed as a quoted, escaped string, so one
+    path always stays on one line and the output reads the same everywhere.
+    """
+    text = prefix + path
+    if any(not char.isprintable() or char == "\\" for char in text):
+        return json.dumps(text)
+    return text
+
+
+def format_status(header, unborn, unresolved, staged, not_staged, untracked) -> list[str]:
+    """Return the lines `minigit status` prints. Empty sections are left out."""
+    lines = [header]
+    if unborn:
+        lines.append("no commits yet")
+    sections = (
+        ("unresolved (merge conflict):", unresolved),
+        ("staged:", staged),
+        ("not staged:", not_staged),
+        ("untracked:", untracked),
+    )
+    shown = False
+    for title, paths in sections:
+        if paths:
+            lines.append(title)
+            lines.extend(f"  {display_path(path)}" for path in sorted(paths))
+            shown = True
+    if not shown:
+        lines.append("clean")
+    return lines
+
+
+def _head_header(head) -> str:
+    """First status line. `head` is what CommitManager.read_head() returned."""
+    if head is None:
+        return "On branch main"  # no HEAD file yet: same default as CommitManager
+    if len(head) == 40 and all(char in "0123456789abcdef" for char in head):
+        return f"HEAD detached at {head[:7]}"
+    return f"On branch {head}"
+
+
+def _unresolved_merge_paths(manager) -> list[str]:
+    """Paths a pending merge has not resolved yet.
+
+    Module 3 owns merge state. Until it offers `unresolved_merge_paths()`, there are none.
+    """
+    helper = getattr(manager, "unresolved_merge_paths", None)
+    return sorted(helper()) if callable(helper) else []
+
+
 def cmd_status(args) -> int:
+    """minigit status: branch, then staged (HEAD tree vs index), not staged (index vs
+    working files) and untracked files. Read-only."""
     wt = WorkingTree()
     index_entries = wt.read_index()
     index_by_path = {e.path: e for e in index_entries}
 
     from minigit.commits import CommitManager
 
-    head_tree_hash = CommitManager(wt.root, store=wt.store, tree=wt).get_head_tree()
+    manager = CommitManager(wt.root, store=wt.store, tree=wt)
+    head_tree_hash = manager.get_head_tree()
     head_entries = wt.read_tree_entries(head_tree_hash) if head_tree_hash else []
     head_by_path = {e.path: e for e in head_entries}
 
@@ -548,44 +648,83 @@ def cmd_status(args) -> int:
             if rel_path not in known_paths:
                 untracked_paths.add(rel_path)
 
-    staged = sorted(staged_paths)
-    not_staged = sorted(not_staged_paths)
-    untracked = sorted(untracked_paths)
-
-    printed_anything = False
-
-    if staged:
-        print("staged:")
-        for path in staged:
-            print(f"  {path}")
-        printed_anything = True
-
-    if not_staged:
-        print("not staged:")
-        for path in not_staged:
-            print(f"  {path}")
-        printed_anything = True
-
-    if untracked:
-        print("untracked:")
-        for path in untracked:
-            print(f"  {path}")
-        printed_anything = True
-
-    if not printed_anything:
-        print("clean")
-
+    lines = format_status(
+        _head_header(manager.read_head()),
+        head_tree_hash is None,
+        _unresolved_merge_paths(manager),
+        staged_paths,
+        not_staged_paths,
+        untracked_paths,
+    )
+    for line in lines:
+        print(line)
     return 0
 
 
 def _hunk_range(start: int, count: int) -> str:
+    """`start` is a 0-based line index. A non-empty range is written 1-based
+    ("3,2" = lines 3 and 4); an empty range is written as the line before it ("2,0")."""
     return f"{start if count == 0 else start + 1},{count}"
 
 
-def _format_change(change: _FileChange) -> list[str]:
-    """Render one file's changes as printable lines."""
+def _diff_lines(prefix: str, line: str) -> list[str]:
+    out = [prefix + line.removesuffix("\n")]
+    if not line.endswith("\n"):
+        out.append("\\ No newline at end of file")
+    return out
+
+
+def _group_edits(edits: list, context: int) -> list[list]:
+    """Group edits that are close enough for their context lines to touch or overlap."""
+    groups: list[list] = []
+    for edit in edits:
+        if groups:
+            last = groups[-1][-1]
+            if edit.start - (last.start + last.old_count) <= 2 * context:
+                groups[-1].append(edit)
+                continue
+        groups.append([edit])
+    return groups
+
+
+def _render_hunk(old_lines: list, group: list, shift: int, context: int):
+    """Return (hunk lines, change in line count). `shift` = lines added minus removed so far."""
+    first, last = group[0], group[-1]
+    old_from = max(0, first.start - context)
+    old_to = min(len(old_lines), last.start + last.old_count + context)
+    body: list[str] = []
+    removed = added = 0
+    position = old_from
+    for edit in group:
+        for line in old_lines[position : edit.start]:
+            body.extend(_diff_lines(" ", line))
+        for line in old_lines[edit.start : edit.start + edit.old_count]:
+            body.extend(_diff_lines("-", line))
+        for line in edit.new_lines:
+            body.extend(_diff_lines("+", line))
+        removed += edit.old_count
+        added += len(edit.new_lines)
+        position = edit.start + edit.old_count
+    for line in old_lines[position:old_to]:
+        body.extend(_diff_lines(" ", line))
+    old_count = old_to - old_from
+    new_count = old_count - removed + added
+    header = (
+        f"@@ -{_hunk_range(old_from, old_count)} +{_hunk_range(old_from + shift, new_count)} @@"
+    )
+    return [header, *body], added - removed
+
+
+def _format_change(change: _FileChange, context: int = CONTEXT_LINES) -> list[str]:
+    """Render one file's changes as printable lines.
+
+    Hunk header: `@@ -<old start>,<old count> +<new start>,<new count> @@`, with the
+    old numbers from the HEAD version and the new ones from the working file.
+    Each hunk shows `context` unchanged lines around the changes; lines start with
+    " " (unchanged), "-" (removed) or "+" (added).
+    """
     path = change.path
-    out = [f"diff --minigit a/{path} b/{path}"]
+    out = [f"diff --minigit {display_path(path, 'a/')} {display_path(path, 'b/')}"]
 
     if change.status == "added":
         out.append(f"new file mode {change.new_mode}")
@@ -596,37 +735,29 @@ def _format_change(change: _FileChange) -> list[str]:
         out.append(f"new mode {change.new_mode}")
 
     if change.binary:
-        if change.content_changed:
-            out.append(f"binary file changed: {path}")
+        if change.status == "added":
+            out.append(f"binary file added: {display_path(path)}")
+        elif change.status == "deleted":
+            out.append(f"binary file deleted: {display_path(path)}")
+        elif change.content_changed:
+            out.append(f"binary file changed: {display_path(path)}")
         return out
     if not change.edits:
         return out  # mode-only change, or an empty file added / deleted
 
-    out.append("--- /dev/null" if change.status == "added" else f"--- a/{path}")
-    out.append("+++ /dev/null" if change.status == "deleted" else f"+++ b/{path}")
+    out.append("--- /dev/null" if change.status == "added" else f"--- {display_path(path, 'a/')}")
+    out.append("+++ /dev/null" if change.status == "deleted" else f"+++ {display_path(path, 'b/')}")
 
-    def emit(prefix: str, line: str) -> None:
-        out.append(prefix + line.removesuffix("\n"))
-        if not line.endswith("\n"):
-            out.append("\\ No newline at end of file")
-
-    offset = 0
-    for edit in change.edits:
-        new_start = edit.start + offset
-        out.append(
-            f"@@ -{_hunk_range(edit.start, edit.old_count)} "
-            f"+{_hunk_range(new_start, len(edit.new_lines))} @@"
-        )
-        for line in change.old_lines[edit.start : edit.start + edit.old_count]:
-            emit("-", line)
-        for line in edit.new_lines:
-            emit("+", line)
-        offset += len(edit.new_lines) - edit.old_count
+    shift = 0
+    for group in _group_edits(change.edits, context):
+        hunk, delta = _render_hunk(change.old_lines, group, shift, context)
+        out.extend(hunk)
+        shift += delta
     return out
 
 
 def cmd_diff(args) -> int:
-    """minigit diff: HEAD tree vs the working files (unborn HEAD = empty tree)."""
+    """minigit diff: HEAD tree vs the working files (unborn HEAD = empty tree). Read-only."""
     wt = WorkingTree()
 
     from minigit.commits import CommitManager
@@ -643,8 +774,12 @@ def register_index_commands(subparsers) -> None:
     add_parser.add_argument("path")
     add_parser.set_defaults(handler=cmd_add)
 
-    status_parser = subparsers.add_parser("status", help="show staged files")
+    status_parser = subparsers.add_parser(
+        "status", help="show the branch and staged, not staged and untracked files"
+    )
     status_parser.set_defaults(handler=cmd_status)
 
-    diff_parser = subparsers.add_parser("diff", help="show line changes since HEAD")
+    diff_parser = subparsers.add_parser(
+        "diff", help="show line changes: the HEAD tree compared with the working files"
+    )
     diff_parser.set_defaults(handler=cmd_diff)

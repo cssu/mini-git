@@ -389,6 +389,62 @@ def test_tree_rejects_null_in_filename(tmp_path):
         ObjectStore(tmp_path).write_tree([TreeEntry("100644", "blob", "a" * 40, "bad\0name")])
 
 
+def test_pack_objects_supports_packed_only_and_mixed_fresh_store(tmp_path: Path) -> None:
+    """
+    Tests that packing objects works correctly for packed-only and mixed fresh stores.
+    """
+    store = ObjectStore(tmp_path)
+    packed = [
+        (b"", "blob"),
+        (b"\x00binary\xff", "blob"),
+        ("unicode \N{SNOWMAN}".encode(), "blob"),
+        (b"tree body", "tree"),
+        (b"commit body", "commit"),
+    ]
+    hashes = [store.write_object(data, obj_type) for data, obj_type in packed]
+    loose_hash = store.write_object(b"still loose", "blob")
+    store.pack_objects(hashes)
+    for obj_hash in hashes:
+        store._object_path(obj_hash).unlink()
+
+    fresh = ObjectStore(tmp_path)
+    for obj_hash, (data, obj_type) in zip(hashes, packed, strict=True):
+        assert fresh.read_object(obj_hash) == (obj_type, data)
+        assert fresh.has_object(obj_hash)
+    assert fresh.read_object(loose_hash) == ("blob", b"still loose")
+
+
+def test_duplicate_write_does_not_recreate_valid_packed_object(tmp_path: Path) -> None:
+    """
+    Tests that writing a duplicate object does not recreate a valid packed object.
+    """
+    store = ObjectStore(tmp_path)
+    obj_hash = store.write_object(b"packed", "blob")
+    store.pack_objects([obj_hash])
+    store._object_path(obj_hash).unlink()
+
+    assert ObjectStore(tmp_path).write_object(b"packed", "blob") == obj_hash
+    assert not store._object_path(obj_hash).exists()
+
+
+def test_corrupt_packed_object_is_not_missing(tmp_path: Path) -> None:
+    """
+    Tests that a corrupt packed object raises ObjectCorruptError when read or checked for existence.
+    """
+    store = ObjectStore(tmp_path)
+    obj_hash = store.write_object(b"content", "blob")
+    pack_path, _ = store.pack_objects([obj_hash])
+    store._object_path(obj_hash).unlink()
+    raw = bytearray(pack_path.read_bytes())
+    raw[-1] ^= 0xFF
+    pack_path.write_bytes(raw)
+
+    with pytest.raises(ObjectCorruptError):
+        ObjectStore(tmp_path).read_object(obj_hash)
+    with pytest.raises(ObjectCorruptError):
+        ObjectStore(tmp_path).has_object(obj_hash)
+
+
 @pytest.mark.parametrize("obj_type", ["unknown", "blob\ncommit", ""])
 def test_write_rejects_unsupported_type_without_creating_objects(tmp_path, obj_type):
     store = ObjectStore(tmp_path)

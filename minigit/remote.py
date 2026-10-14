@@ -219,7 +219,20 @@ class RemoteClient:
             raise NetworkProtocolError(f"remote rejected {obj_hash}: {reply}")
 
     def pull(self, remote_address: str, branch: str, token: str) -> None:
-        """Fetch `branch` from the remote and update the matching local ref."""
+        """Fetch a complete branch graph and update the matching local ref.
+
+        The commit tip alone is not sufficient: an interrupted transfer can
+        leave a commit present while its parents, trees, or blobs are absent.
+        Walking the received objects here makes pull repair that state before
+        publishing the local ref.
+
+        Raises NetworkProtocolError if the remote's tip is not an ancestor of the
+        local tip, or if any object is missing or corrupt.
+
+        (M1) Raise NetworkProtocolError if any object is missing or has the wrong type,
+        and ensure that all commits, trees, and blobs reachable from the
+        remote tip are present locally after the pull.
+        """
 
         host, port = self._parse_address(remote_address)
         if len(token) == 0:
@@ -239,11 +252,72 @@ class RemoteClient:
 
             send_line(sock, f"REF {branch}")
             reply = receive_line(sock, buf)
-            remote_hash = reply.rsplit(" ", 1)[1]
-            print(f"remote {branch} is at {remote_hash}")
-            print("# Week 6 - same exchange in reverse")
+            fields = reply.split(" ")
+            if len(fields) != 3 or fields[:2] != ["REF", branch]:
+                raise NetworkProtocolError(f"invalid REF response: {reply!r}")
+            remote_hash = fields[2]
+            if remote_hash == "-":
+                raise NetworkProtocolError(f"remote branch {branch!r} has no commits")
+            if len(remote_hash) != 40 or any(c not in "0123456789abcdef" for c in remote_hash):
+                raise NetworkProtocolError(f"invalid remote hash: {remote_hash!r}")
+
+            seen: set[str] = set()
+            pending = [remote_hash]
+            while pending:
+                commit_hash = pending.pop()
+                if commit_hash in seen:
+                    continue
+                seen.add(commit_hash)
+                self._pull_object(sock, buf, commit_hash, "commit")
+                commit = self.commits.read_commit(commit_hash)
+                self._pull_tree(sock, buf, commit.tree, seen)
+                pending.extend(commit.parents)
+
+            local_hash = self.commits.read_ref(branch)
+            if local_hash is not None and local_hash != remote_hash:
+                if not _is_ancestor(self.commits, local_hash, remote_hash):
+                    raise NetworkProtocolError(f"local {branch} has diverged from remote")
+            self.commits.write_ref(branch, remote_hash)
+            send_line(sock, "DONE")
+            print(f"{branch} now at {remote_hash}")
         finally:
             sock.close()
+
+    def _pull_object(self, sock, buf: bytearray, obj_hash: str, expected_type: str) -> None:
+        """
+        (M1)Helper function to ensure one object exists
+        locally and has the type its graph requires.
+        Raises NetworkProtocolError if the object is missing or has the wrong type.
+        """
+        if _has_object(self.store, obj_hash):
+            obj_type, _ = self.store.read_object(obj_hash)
+            if obj_type != expected_type:
+                raise NetworkProtocolError(
+                    f"object {obj_hash} is a {obj_type}, expected a {expected_type}"
+                )
+            return
+
+        send_line(sock, f"WANT {obj_hash}")
+        self._receive_object(sock, buf, obj_hash)
+        obj_type, _ = self.store.read_object(obj_hash)
+        if obj_type != expected_type:
+            raise NetworkProtocolError(
+                f"object {obj_hash} is a {obj_type}, expected a {expected_type}"
+            )
+
+    def _pull_tree(self, sock, buf: bytearray, tree_hash: str, seen: set[str]) -> None:
+        """
+        (M1) Helper function to ensure a tree and all nested trees/blobs exist locally.
+        Raises NetworkProtocolError if any object is missing or has the wrong type."""
+        if tree_hash in seen:
+            return
+        seen.add(tree_hash)
+        self._pull_object(sock, buf, tree_hash, "tree")
+        for entry in self.store.read_tree(tree_hash):
+            if entry.type == "tree":
+                self._pull_tree(sock, buf, entry.hash, seen)
+            else:
+                self._pull_object(sock, buf, entry.hash, "blob")
 
     def fetch_objects(self, remote_address: str, hashes: list[str], token: str) -> None:
         """Fetch each of `hashes` from the remote and write it into the local store.

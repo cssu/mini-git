@@ -421,6 +421,51 @@ def test_fetch_objects_stores_multiple_objects_from_one_connection(remote_server
     assert local_store.read_object(commit_hash) == ("commit", b"tree deadbeef")
 
 
+def test_pull_fetches_missing_descendants_when_tip_already_exists(push_pair, tmp_path):
+    """
+    (M1) Tests that a pull operation fetches all missing objects (commits, trees, blobs)
+    when the local tip already exists on the remote,
+    ensuring the local repository has a complete history and all necessary objects after the pull.
+    """
+    pair = push_pair
+    left = _commit(
+        pair.local_store,
+        pair.local_commits,
+        {"shared": b"\x00shared", "run.sh": b"#!/bin/sh\n"},
+        [],
+    )
+    right = _commit(
+        pair.local_store,
+        pair.local_commits,
+        {"right.txt": "caf\u00e9".encode()},
+        [],
+    )
+    merge = _commit(
+        pair.local_store,
+        pair.local_commits,
+        {"nested/file": b"nested", "run.sh": b"#!/bin/sh\n"},
+        [left, right],
+    )
+    pair.client.push(pair.address, "main", "tok")
+
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    destination_store = ObjectStore(destination)
+    destination_commits = CommitManager(destination, store=destination_store)
+    commit_type, commit_bytes = pair.local_store.read_object(merge)
+    assert commit_type == "commit"
+    destination_store.write_object(commit_bytes, commit_type)
+    destination_client = RemoteClient(
+        repo_path=destination, store=destination_store, commits=destination_commits
+    )
+
+    destination_client.pull(pair.address, "main", "tok")
+
+    assert destination_commits.read_ref("main") == merge
+    for obj_hash in pair.client.collect_reachable("main"):
+        assert destination_store.read_object(obj_hash) == pair.local_store.read_object(obj_hash)
+
+
 def test_fetch_objects_unknown_hash_raises(remote_server, tmp_path):
     client = RemoteClient(store=ObjectStore(str(tmp_path / "local")), commits=FakeCommitManager())
     with pytest.raises(NetworkProtocolError):

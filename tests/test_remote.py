@@ -9,7 +9,7 @@ import pytest
 
 from minigit.cli import main
 from minigit.commits import CommitManager
-from minigit.errors import NetworkProtocolError
+from minigit.errors import NetworkProtocolError, ObjectNotFoundError
 from minigit.objects import ObjectStore
 from minigit.objects import TreeEntry as RealTreeEntry
 from minigit.remote import RemoteClient, RemoteServer, receive_line, recv_exact, send_line
@@ -205,6 +205,60 @@ def test_push_nested_files_multiple_commits(push_pair):
     # server never touches its own HEAD/index while handling a push
     assert not (Path(pair.server.repo_path) / ".minigit" / "HEAD").exists()
     assert not (Path(pair.server.repo_path) / ".minigit" / "index").exists()
+
+
+def test_pull_fetches_missing_descendants_from_packed_remote(tmp_path, push_pair):
+    """Pull fetches a merge graph even when the local commit already exists."""
+
+    pair = push_pair
+    base = _commit(
+        pair.local_store,
+        pair.local_commits,
+        {"base.txt": b"base", "shared/empty": b""},
+        [],
+    )
+    side = _commit(
+        pair.local_store,
+        pair.local_commits,
+        {"side.bin": b"\x00\xff", "shared/name": "caf\u00e9".encode()},
+        [base],
+    )
+    merge = _commit(
+        pair.local_store,
+        pair.local_commits,
+        {"nested/run.sh": b"#!/bin/sh\n", "shared/name": "caf\u00e9".encode()},
+        [base, side],
+    )
+    pair.client.push(pair.address, "main", "tok")
+
+    reachable = pair.client.collect_reachable("main")
+    pair.remote_store.pack_objects(reachable)
+    for obj_hash in reachable:
+        pair.remote_store._object_path(obj_hash).unlink()
+
+    destination_root = tmp_path / "destination"
+    destination_root.mkdir()
+    destination_store = ObjectStore(destination_root)
+    destination_commits = CommitManager(str(destination_root), store=destination_store)
+    destination_client = RemoteClient(
+        repo_path=str(destination_root),
+        store=destination_store,
+        commits=destination_commits,
+    )
+
+    commit_type, commit_bytes = pair.local_store.read_object(merge)
+    assert commit_type == "commit"
+    destination_store.write_object(commit_bytes, "commit")
+    destination_commits.write_ref("main", merge)
+    with pytest.raises(ObjectNotFoundError):
+        destination_store.read_object(base)
+
+    destination_client.pull(pair.address, "main", "tok")
+
+    assert destination_commits.read_ref("main") == merge
+    assert destination_client.collect_reachable("main") == reachable
+    for obj_hash in reachable:
+        assert destination_store.read_object(obj_hash) == pair.local_store.read_object(obj_hash)
 
 
 def test_push_to_empty_branch_then_one_more_commit(push_pair):

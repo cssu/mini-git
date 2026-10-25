@@ -1508,3 +1508,105 @@ def test_cli_branch_or_all_required(push_pair, monkeypatch, capsys, args):
     command, *rest = args
     assert main([command, push_pair.address, *rest, "--token", "tok"]) == 1
     assert "either a branch name or --all" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("port", ["²", "9" * 5000])
+def test_non_ascii_and_oversized_ports_raise_protocol_errors(port):
+    with pytest.raises(NetworkProtocolError):
+        make_client()._parse_address(f"localhost:{port}")
+
+
+@pytest.mark.parametrize("token", ["", "secret\nREFS", "secret\0", "secret\t"])
+def test_server_rejects_unusable_tokens_before_listening(tmp_path, token):
+    with pytest.raises(NetworkProtocolError):
+        RemoteServer(tmp_path, token=token)
+
+
+def test_client_rejects_control_characters_without_echoing_token(tmp_path):
+    token = "private-demo-token\nREFS"
+    with pytest.raises(NetworkProtocolError) as info:
+        RemoteClient(tmp_path).list_refs("localhost:9418", token)
+    assert "private-demo-token" not in str(info.value)
+
+
+def test_server_reply_cannot_echo_token_into_client_error(monkeypatch, tmp_path):
+    token = "private-demo-token"
+    client = _scripted_client(monkeypatch, tmp_path, f"OK\nERR {token}\n".encode())
+    with pytest.raises(NetworkProtocolError) as info:
+        client.fetch("localhost:9418", "main", token)
+    assert token not in str(info.value)
+
+
+@pytest.mark.parametrize("ending", [b"", b"\n"])
+def test_oversized_protocol_line_is_rejected(ending):
+    from minigit.remote import MAX_PROTOCOL_LINE_BYTES
+
+    sock = FakeReceiveSocket(b"x" * (MAX_PROTOCOL_LINE_BYTES + 1) + ending)
+    with pytest.raises(NetworkProtocolError, match="too long"):
+        receive_line(sock, bytearray())
+
+
+def test_fetch_rejects_one_hash_used_as_both_tree_and_parent(push_pair):
+    pair = push_pair
+    tree = pair.remote_store.write_tree([])
+    body = pair.remote_commits._format_commit(tree, [tree], "Test <t@example.com>", "bad parent")
+    tip = pair.remote_store.write_object(body.encode(), "commit")
+    pair.remote_commits.write_ref("main", tip)
+    with pytest.raises(NetworkProtocolError, match="expected a commit"):
+        pair.client.fetch(pair.address, "main", "tok")
+    assert pair.local_commits.read_ref("main") is None
+
+
+def test_nested_branches_round_trip_and_share_objects(push_pair, monkeypatch):
+    pair = push_pair
+    tip = _commit(pair.local_store, pair.local_commits, {"shared": b"content"}, [])
+    pair.local_commits.create_branch("feature/topic", tip)
+    pair.client.push(pair.address, "main", "tok")
+    pair.client.push(pair.address, "feature/topic", "tok")
+    assert pair.client.list_refs(pair.address, "tok") == {"feature/topic": tip, "main": tip}
+    received = _count_receives(monkeypatch)
+    pair.client.pull(pair.address, "feature/topic", "tok")
+    assert received == []
+    assert pair.local_commits.read_ref("feature/topic") == tip
+
+
+@pytest.mark.parametrize("ref_request", ["REF feature", "REF escape/topic", "REF bad\tname"])
+def test_bad_ref_session_does_not_stop_server(push_pair, ref_request):
+    pair = push_pair
+    tip = _commit(pair.remote_store, pair.remote_commits, {}, [])
+    pair.remote_commits.create_branch("feature/topic", tip)
+    refs = Path(pair.server.repo_path) / ".minigit/refs/heads"
+    (refs / "escape").symlink_to(refs / "feature", target_is_directory=True)
+    with socket.create_connection(("127.0.0.1", pair.server.port), timeout=2) as sock:
+        buf = bytearray()
+        send_line(sock, "AUTH tok")
+        assert receive_line(sock, buf) == "OK"
+        send_line(sock, ref_request)
+        assert receive_line(sock, buf).startswith("ERR ")
+    assert pair.client.list_refs(pair.address, "tok") == {"feature/topic": tip, "main": tip}
+
+
+def test_oversized_object_length_is_rejected_and_next_client_succeeds(push_pair):
+    pair = push_pair
+    with socket.create_connection(("127.0.0.1", pair.server.port), timeout=2) as sock:
+        buf = bytearray()
+        send_line(sock, "AUTH tok")
+        assert receive_line(sock, buf) == "OK"
+        send_line(sock, f"PUSH main - {KNOWN_HASH}")
+        assert receive_line(sock, buf) == "OK"
+        send_line(sock, f"PUT {KNOWN_HASH}")
+        send_line(sock, "OBJ blob " + "9" * 5000)
+        assert receive_line(sock, buf) == "ERR malformed OBJ header"
+    assert pair.remote_commits.read_ref("main") is None
+    assert pair.client.list_refs(pair.address, "tok") == {}
+
+
+def test_fetch_rejects_oversized_object_length(monkeypatch, tmp_path):
+    client = _scripted_client(
+        monkeypatch,
+        tmp_path,
+        f"OK\nREF main {KNOWN_HASH}\nOBJ commit {'9' * 5000}\n".encode(),
+    )
+    with pytest.raises(NetworkProtocolError, match="malformed OBJ header"):
+        client.fetch("localhost:9418", "main", "tok")
+    assert not client.store.has_object(KNOWN_HASH)

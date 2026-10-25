@@ -428,6 +428,8 @@ class RemoteClient:
         """
 
         host, port = self._preflight(remote_address, token, "fetch")
+        if any(not _valid_hash(obj_hash) for obj_hash in hashes):
+            raise NetworkProtocolError("invalid object hash")
         with self._session(host, port, token, "fetch") as (sock, buf):
             for obj_hash in dict.fromkeys(hashes):
                 send_line(sock, f"WANT {obj_hash}")
@@ -527,6 +529,8 @@ class RemoteServer:
         commits=None,
         conn_timeout=10.0,
     ):
+        if not token or any(ord(char) < 32 or ord(char) == 127 for char in token):
+            raise NetworkProtocolError("serve needs a nonempty token without control characters")
         self.repo_path = repo_path
         self.token = token
         self.host = host
@@ -537,9 +541,13 @@ class RemoteServer:
         )
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind((host, port))
-        self._sock.listen()
+        try:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind((host, port))
+            self._sock.listen()
+        except (OSError, OverflowError) as exc:
+            self._sock.close()
+            raise NetworkProtocolError(f"could not listen on {host}:{port}") from exc
         # accept() polls this instead of blocking forever: closing the socket
         # from another thread isn't guaranteed to unblock a pending accept()
         # on every platform (it does on macOS, not reliably on Linux).
@@ -930,5 +938,10 @@ def cmd_serve(args) -> int:
 
     server = RemoteServer(port=args.port, token=args.token)
     print(f"listening on {server.host}:{server.port}")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.close()
     return 0

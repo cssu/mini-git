@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pytest
 
+from minigit.cli import main
 from minigit.commits import CommitManager
 from minigit.errors import (
+    MergeConflictError,
     MiniGitError,
     ObjectCorruptError,
     ObjectNotFoundError,
@@ -14,7 +16,7 @@ from minigit.errors import (
     RefNotFoundError,
 )
 from minigit.index import WorkingTree
-from minigit.objects import ObjectStore
+from minigit.objects import ObjectStore, TreeEntry
 
 AUTHOR = "Daniel <d@example.com>"
 
@@ -37,10 +39,22 @@ class FakeWorkingTree:
         return self.index_tree
 
     def checkout(self, tree_hash: str) -> None:
-        "record checkout"
+        """Record checkout."""
         if self.fail:
             raise MiniGitError("checkout failed")
         self.checked_out.append(tree_hash)
+
+    def read_tree_entries(self, tree_hash: str):
+        """Delegate flatten to a real WorkingTree over the same store."""
+        return WorkingTree(str(self.store.root), store=self.store).read_tree_entries(tree_hash)
+
+    def read_index(self):
+        """Return recorded index entries, if any."""
+        return list(getattr(self, "index_entries", []))
+
+    def write_index(self, entries) -> None:
+        """Record index writes from merge conflict restoration."""
+        self.index_entries = list(entries)
 
 
 def make_manager(temp_path, tree=None):
@@ -387,7 +401,8 @@ def make_real_manager(temp_path):
 
 def commit_file(m, path, contents, message):
     """Write `contents` to `path`, stage it, and commit on the current branch."""
-    (Path(m.root) / path).write_text(contents)
+    with open(Path(m.root) / path, "w", encoding="utf-8", newline="") as file:
+        file.write(contents)
     m.tree.stage_file(path)
     parent = m.read_ref(m._current_branch())
     parents = [parent] if parent else []
@@ -552,8 +567,8 @@ def test_merge_into_unborn_branch_creates_the_ref(tmp_path):
     assert m.tree.checked_out == [tree]
 
 
-def test_merge_diverged_history_raises_and_changes_nothing(tmp_path):
-    """Diverged histories raise MiniGitError and leave both refs and HEAD alone."""
+def test_merge_diverged_identical_trees_creates_merge_commit(tmp_path):
+    """Diverged history with the same tree is a clean two-parent merge."""
     m = make_manager(tmp_path)
     tree = make_tree(m)
     a = m.create_commit(tree, [], AUTHOR, "a")
@@ -562,12 +577,12 @@ def test_merge_diverged_history_raises_and_changes_nothing(tmp_path):
     b = m.create_commit(tree, [a], AUTHOR, "b")
     m.write_head("main")
     c = m.create_commit(tree, [a], AUTHOR, "c")
-    with pytest.raises(MiniGitError, match="three-way merge is not implemented yet"):
-        m.merge("feature")
-    assert m.read_ref("main") == c
+    merge_hash = m.merge("feature")
+    assert merge_hash is not None
+    assert m.read_commit(merge_hash).parents == [c, b]
+    assert m.read_ref("main") == merge_hash
     assert m.read_ref("feature") == b
     assert m.read_head() == "main"
-    assert m.tree.checked_out == []
 
 
 def test_merge_with_staged_changes_leaves_refs_unchanged(tmp_path):
@@ -630,3 +645,540 @@ def test_real_fast_forward_restores_target_files(tmp_path):
     assert m.read_head() == "main"
     assert count_object_files(tmp_path) == objects_before
     assert a != b
+
+
+# week 5 three-way merge
+
+
+def write_file_tree(m, files: dict[str, str]) -> str:
+    """Write a flat tree of path -> text content and return its hash."""
+    entries = [
+        TreeEntry("100644", "blob", m.store.write_object(content.encode(), "blob"), path)
+        for path, content in files.items()
+    ]
+    return m.store.write_tree(entries)
+
+
+def commit_tree_files(m, files: dict[str, str], message: str) -> str:
+    """Commit `files` on the current branch and keep the fake index in sync."""
+    tree = write_file_tree(m, files)
+    parent = m.read_ref(m._current_branch())
+    parents = [parent] if parent else []
+    commit_hash = m.create_commit(tree, parents, AUTHOR, message)
+    m.tree.index_tree = tree
+    return commit_hash
+
+
+def setup_diverged(m, base_files, ours_files, theirs_files):
+    """Create diverged `main` (ours) and `feature` (theirs) from a shared base."""
+    base = commit_tree_files(m, base_files, "base")
+    m.create_branch("feature", base)
+    ours = commit_tree_files(m, ours_files, "ours")
+    m.write_head("feature")
+    theirs = commit_tree_files(m, theirs_files, "theirs")
+    m.write_head("main")
+    m.tree.index_tree = m.read_commit(ours).tree
+    return ours, theirs
+
+
+def blob_text(m, tree_hash: str, path: str) -> str:
+    """Return the decoded blob for `path` in `tree_hash`."""
+    blob = next(entry.hash for entry in m.tree.read_tree_entries(tree_hash) if entry.path == path)
+    _, data = m.store.read_object(blob)
+    return data.decode()
+
+
+def test_merge_separate_files_is_clean(tmp_path):
+    """Each side added a different file; merge keeps both and writes two parents."""
+    m = make_manager(tmp_path)
+    ours, theirs = setup_diverged(
+        m,
+        {"shared.txt": "base\n"},
+        {"shared.txt": "base\n", "ours.txt": "ours\n"},
+        {"shared.txt": "base\n", "theirs.txt": "theirs\n"},
+    )
+    merge_hash = m.merge("feature")
+    commit = m.read_commit(merge_hash)
+    assert commit.parents == [ours, theirs]
+    assert m.read_ref("main") == merge_hash
+    assert m.read_ref("feature") == theirs
+    assert m.read_head() == "main"
+    paths = {entry.path for entry in m.tree.read_tree_entries(commit.tree)}
+    assert paths == {"shared.txt", "ours.txt", "theirs.txt"}
+
+
+def test_merge_disjoint_lines_is_clean(tmp_path):
+    """Edits on different lines combine into one file."""
+    m = make_manager(tmp_path)
+    ours, theirs = setup_diverged(
+        m,
+        {"file.txt": "a\nb\nc\n"},
+        {"file.txt": "A\nb\nc\n"},
+        {"file.txt": "a\nb\nC\n"},
+    )
+    merge_hash = m.merge("feature")
+    assert m.read_commit(merge_hash).parents == [ours, theirs]
+    assert blob_text(m, m.read_commit(merge_hash).tree, "file.txt") == "A\nb\nC\n"
+
+
+def test_merge_same_line_conflict_writes_markers_and_keeps_refs(tmp_path):
+    """Same line edited two ways: markers in the result tree, refs not moved."""
+    m = make_manager(tmp_path)
+    ours, theirs = setup_diverged(
+        m,
+        {"file.txt": "x\n"},
+        {"file.txt": "ours\n"},
+        {"file.txt": "theirs\n"},
+    )
+    with pytest.raises(MergeConflictError) as info:
+        m.merge("feature")
+    assert info.value.paths == ["file.txt"]
+    assert m.read_ref("main") == ours
+    assert m.read_ref("feature") == theirs
+    assert m.read_head() == "main"
+    text = blob_text(m, m.tree.checked_out[-1], "file.txt")
+    assert "<<<<<<< HEAD" in text
+    assert "ours" in text
+    assert "=======" in text
+    assert "theirs" in text
+    assert ">>>>>>> feature" in text
+
+
+def test_merge_identical_edits_taken_once(tmp_path):
+    """Both sides made the same change; merge takes it once."""
+    m = make_manager(tmp_path)
+    setup_diverged(
+        m,
+        {"file.txt": "a\n"},
+        {"file.txt": "b\n"},
+        {"file.txt": "b\n"},
+    )
+    merge_hash = m.merge("feature")
+    assert blob_text(m, m.read_commit(merge_hash).tree, "file.txt") == "b\n"
+
+
+def test_merge_add_add_same_content_is_clean(tmp_path):
+    """Both sides added the same new file."""
+    m = make_manager(tmp_path)
+    setup_diverged(
+        m,
+        {"keep.txt": "k\n"},
+        {"keep.txt": "k\n", "new.txt": "same\n"},
+        {"keep.txt": "k\n", "new.txt": "same\n"},
+    )
+    merge_hash = m.merge("feature")
+    paths = {entry.path for entry in m.tree.read_tree_entries(m.read_commit(merge_hash).tree)}
+    assert paths == {"keep.txt", "new.txt"}
+    assert blob_text(m, m.read_commit(merge_hash).tree, "new.txt") == "same\n"
+
+
+def test_merge_delete_delete_is_clean(tmp_path):
+    """Both sides deleted the same file."""
+    m = make_manager(tmp_path)
+    setup_diverged(m, {"gone.txt": "x\n"}, {}, {})
+    merge_hash = m.merge("feature")
+    assert m.tree.read_tree_entries(m.read_commit(merge_hash).tree) == []
+
+
+def test_merge_modify_delete_is_conflict(tmp_path):
+    """One side edited, the other deleted."""
+    m = make_manager(tmp_path)
+    ours, theirs = setup_diverged(
+        m,
+        {"file.txt": "a\n"},
+        {"file.txt": "b\n"},
+        {},
+    )
+    with pytest.raises(MergeConflictError) as info:
+        m.merge("feature")
+    assert info.value.paths == ["file.txt"]
+    assert m.read_ref("main") == ours
+    assert m.read_ref("feature") == theirs
+
+
+def test_merge_same_position_insertions_conflict(tmp_path):
+    """Insertions at the same base index conflict."""
+    m = make_manager(tmp_path)
+    with pytest.raises(MergeConflictError) as info:
+        setup_diverged(
+            m,
+            {"file.txt": "a\nc\n"},
+            {"file.txt": "a\nours\nc\n"},
+            {"file.txt": "a\ntheirs\nc\n"},
+        )
+        m.merge("feature")
+    assert info.value.paths == ["file.txt"]
+
+
+def test_find_merge_base_through_second_parent(tmp_path):
+    """Ancestry follows every parent when locating the merge base."""
+    m = make_manager(tmp_path)
+    tree = make_tree(m)
+    base = m.create_commit(tree, [], AUTHOR, "base")
+    left = m.create_commit(tree, [base], AUTHOR, "left")
+    right = m.create_commit(tree, [base], AUTHOR, "right")
+    merged = m.create_commit(tree, [left, right], AUTHOR, "merge")
+    later = m.create_commit(tree, [merged], AUTHOR, "later")
+    assert m.find_merge_base(later, right) == right
+
+
+def test_merge_unrelated_history_raises(tmp_path):
+    """Two root commits have no common ancestor."""
+    m = make_manager(tmp_path)
+    tree = make_tree(m)
+    a = m.create_commit(tree, [], AUTHOR, "a")
+    m.create_branch("feature", a)
+    m.create_commit(tree, [], AUTHOR, "b")
+    with pytest.raises(MiniGitError, match="no common ancestor"):
+        m.merge("feature")
+
+
+def test_merge_multiple_bases_raises(tmp_path):
+    """Two incomparable common ancestors raise MiniGitError."""
+    m = make_manager(tmp_path)
+    tree = make_tree(m)
+    root = m.create_commit(tree, [], AUTHOR, "root")
+    a = m.create_commit(tree, [root], AUTHOR, "a")
+    b = m.create_commit(tree, [root], AUTHOR, "b")
+    ours = m.create_commit(tree, [a, b], AUTHOR, "ours")
+    m.create_branch("feature", ours)
+    m.write_head("feature")
+    m.create_commit(tree, [b, a], AUTHOR, "theirs")
+    m.write_head("main")
+    with pytest.raises(MiniGitError, match="multiple merge bases"):
+        m.merge("feature")
+
+
+def test_merge_dirty_index_leaves_refs_and_no_pending_state(tmp_path):
+    """Staged changes block a three-way merge before writes."""
+    m = make_manager(tmp_path)
+    ours, theirs = setup_diverged(
+        m,
+        {"file.txt": "a\n"},
+        {"file.txt": "ours\n"},
+        {"file.txt": "theirs-side\n"},
+    )
+    m.tree.index_tree = m.store.hash_object(b"staged", "tree")
+    with pytest.raises(MiniGitError):
+        m.merge("feature")
+    assert m.read_ref("main") == ours
+    assert m.read_ref("feature") == theirs
+    assert m.read_head() == "main"
+    assert not (tmp_path / ".minigit" / "MERGE_HEAD").exists()
+
+
+def test_merge_failed_checkout_leaves_refs_and_no_pending_state(tmp_path):
+    """A checkout that raises during three-way merge writes no pending state."""
+    m = make_manager(tmp_path)
+    ours, theirs = setup_diverged(
+        m,
+        {"file.txt": "a\n"},
+        {"file.txt": "ours\n"},
+        {"file.txt": "theirs-side\n"},
+    )
+    m.tree.fail = True
+    with pytest.raises(MiniGitError, match="checkout failed"):
+        m.merge("feature")
+    assert m.read_ref("main") == ours
+    assert m.read_ref("feature") == theirs
+    assert not (tmp_path / ".minigit" / "MERGE_HEAD").exists()
+
+
+def test_cli_conflict_then_resolve_add_commit(tmp_path, monkeypatch):
+    """A new process cannot commit until conflicts are added; then both parents are kept."""
+    monkeypatch.chdir(tmp_path)
+    m = make_real_manager(tmp_path)
+    base = commit_file(m, "file.txt", "x\n", "base")
+    m.create_branch("feature", base)
+    ours = commit_file(m, "file.txt", "ours\n", "ours")
+    m.switch_branch("feature")
+    theirs = commit_file(m, "file.txt", "theirs\n", "theirs")
+    m.switch_branch("main")
+    with pytest.raises(MergeConflictError):
+        CommitManager(str(tmp_path), store=m.store, tree=m.tree).merge("feature")
+    assert main(["commit", "-m", "too-soon"]) == 1
+    (tmp_path / "file.txt").write_text("resolved\n")
+    assert main(["add", "file.txt"]) == 0
+    assert main(["commit", "-m", "unused"]) == 0
+    fresh = CommitManager(str(tmp_path))
+    commit = fresh.read_commit(fresh.read_ref("main"))
+    assert commit.parents == [ours, theirs]
+    assert not (tmp_path / ".minigit" / "MERGE_HEAD").exists()
+
+
+# fetched-tip integration
+
+
+def test_integrate_unborn_checks_out_then_advances_ref(tmp_path):
+    """An unborn checked-out branch gets the fetched tree, then the ref."""
+    m = make_manager(tmp_path)
+    tree = make_tree(m)
+    tip = m.create_commit(tree, [], AUTHOR, "fetched")
+    (tmp_path / ".minigit" / "refs" / "heads" / "main").unlink()
+    assert m.integrate_fetched_tip("main", tip) is None
+    assert m.read_ref("main") == tip
+    assert m._current_branch() == "main"
+    assert m.tree.checked_out == [tree]
+
+
+def test_integrate_equal_tips_change_nothing(tmp_path):
+    """The same tip does not move the ref or check out."""
+    m = make_manager(tmp_path)
+    tip = m.create_commit(make_tree(m), [], AUTHOR, "same")
+    m.write_head("main")
+    assert m.integrate_fetched_tip("main", tip) is None
+    assert m.read_ref("main") == tip
+    assert m.tree.checked_out == []
+
+
+def test_integrate_remote_ahead_fast_forwards(tmp_path):
+    """A downloaded descendant is checked out, then the current ref moves to it."""
+    m = make_manager(tmp_path)
+    tree = make_tree(m)
+    local = m.create_commit(tree, [], AUTHOR, "local")
+    remote = m.create_commit(tree, [local], AUTHOR, "remote")
+    m.write_ref("main", local)
+    m.write_head("main")
+    assert m.integrate_fetched_tip("main", remote) is None
+    assert m.read_ref("main") == remote
+    assert m.read_head() == "main"
+    assert m.tree.checked_out == [tree]
+
+
+def test_integrate_local_ahead_is_a_no_op(tmp_path):
+    """A downloaded ancestor stays behind the local tip."""
+    m = make_manager(tmp_path)
+    tree = make_tree(m)
+    ancestor = m.create_commit(tree, [], AUTHOR, "ancestor")
+    local = m.create_commit(tree, [ancestor], AUTHOR, "local")
+    m.write_head("main")
+    assert m.integrate_fetched_tip("main", ancestor) is None
+    assert m.read_ref("main") == local
+    assert m.tree.checked_out == []
+
+
+def test_integrate_clean_divergence_commits_local_then_fetched(tmp_path):
+    """A clean split writes one merge commit with parents [local, fetched]."""
+    m = make_manager(tmp_path)
+    local, fetched = setup_diverged(
+        m,
+        {"shared.txt": "base\n"},
+        {"shared.txt": "base\n", "ours.txt": "ours\n"},
+        {"shared.txt": "base\n", "theirs.txt": "theirs\n"},
+    )
+    merge_hash = m.integrate_fetched_tip("main", fetched)
+    assert m.read_commit(merge_hash).parents == [local, fetched]
+    assert m.read_ref("main") == merge_hash
+    assert m.read_head() == "main"
+
+
+def test_integrate_text_conflict_keeps_both_tips(tmp_path):
+    """A same-line conflict saves the merge and leaves both tips in place."""
+    m = make_manager(tmp_path)
+    local, fetched = setup_diverged(
+        m,
+        {"file.txt": "x\n"},
+        {"file.txt": "ours\n"},
+        {"file.txt": "theirs\n"},
+    )
+    with pytest.raises(MergeConflictError) as info:
+        m.integrate_fetched_tip("main", fetched)
+    assert info.value.paths == ["file.txt"]
+    assert m.read_ref("main") == local
+    assert m.read_ref("feature") == fetched
+    assert (tmp_path / ".minigit" / "MERGE_HEAD").read_text().strip() == fetched
+    assert (tmp_path / ".minigit" / "MERGE_OURS").read_text().strip() == local
+
+
+def test_integrate_absent_branch_creates_ref_only(tmp_path):
+    """A missing branch that is not checked out is created without checkout."""
+    m = make_manager(tmp_path)
+    tree = make_tree(m)
+    tip = m.create_commit(tree, [], AUTHOR, "main")
+    m.write_head("main")
+    assert m.integrate_fetched_tip("feature", tip) is None
+    assert m.read_ref("feature") == tip
+    assert m.read_ref("main") == tip
+    assert m.read_head() == "main"
+    assert m.tree.checked_out == []
+
+
+def test_integrate_inactive_fast_forward_does_not_touch_head_or_files(tmp_path):
+    """Another branch moves forward without checkout, HEAD, or index changes."""
+    m = make_manager(tmp_path)
+    tree = make_tree(m)
+    older = m.create_commit(tree, [], AUTHOR, "older")
+    m.create_branch("feature", older)
+    newer = m.create_commit(tree, [older], AUTHOR, "newer")
+    m.write_head("main")
+    assert m.integrate_fetched_tip("feature", newer) is None
+    assert m.read_ref("feature") == newer
+    assert m.read_ref("main") == newer
+    assert m.read_head() == "main"
+    assert m.tree.checked_out == []
+
+
+def test_integrate_inactive_divergence_rejects_without_local_changes(tmp_path):
+    """A split branch that is not checked out is refused, and local work stays."""
+    m = make_manager(tmp_path)
+    local, fetched = setup_diverged(
+        m,
+        {"file.txt": "base\n"},
+        {"file.txt": "ours\n"},
+        {"file.txt": "theirs\n"},
+    )
+    with pytest.raises(MiniGitError, match="check out that branch and pull again"):
+        m.integrate_fetched_tip("feature", local)
+    assert m.read_ref("main") == local
+    assert m.read_ref("feature") == fetched
+    assert m.read_head() == "main"
+    assert m.tree.checked_out == []
+    assert not (tmp_path / ".minigit" / "MERGE_HEAD").exists()
+
+
+def test_integrate_fetched_merge_uses_second_parent_as_base(tmp_path):
+    """A fetched merge whose second parent is the base is walked once per commit."""
+    m = make_manager(tmp_path)
+    base = commit_tree_files(m, {"shared.txt": "base\n"}, "base")
+    m.create_branch("side", base)
+    local = commit_tree_files(m, {"shared.txt": "base\n", "local.txt": "L\n"}, "local")
+    m.write_head("side")
+    side = commit_tree_files(m, {"shared.txt": "base\n", "side.txt": "S\n"}, "side")
+    side_tree = m.read_commit(side).tree
+    m.write_head("main")
+    m.tree.index_tree = m.read_commit(local).tree
+    fetched = m.store.write_object(
+        m._format_commit(side_tree, [side, base], AUTHOR, "fetched-merge").encode(),
+        "commit",
+    )
+    assert m.find_merge_base(local, fetched) == base
+    merge_hash = m.integrate_fetched_tip("main", fetched)
+    assert m.read_commit(merge_hash).parents == [local, fetched]
+    history = m.walk_history(merge_hash)
+    assert history.count(base) == 1
+    assert set(history) == {merge_hash, local, fetched, side, base}
+
+
+def test_integrate_missing_history_does_not_move_ref(tmp_path):
+    """A missing fetched commit leaves the existing ref in place."""
+    m = make_manager(tmp_path)
+    local = m.create_commit(make_tree(m), [], AUTHOR, "local")
+    with pytest.raises(ObjectNotFoundError):
+        m.integrate_fetched_tip("main", "ab" * 20)
+    assert m.read_ref("main") == local
+    assert not (tmp_path / ".minigit" / "refs" / "heads" / "feature").exists()
+
+
+def test_integrate_corrupt_history_does_not_move_ref(tmp_path):
+    """A blob passed off as a commit does not create or move a ref."""
+    m = make_manager(tmp_path)
+    local = m.create_commit(make_tree(m), [], AUTHOR, "local")
+    blob = m.store.write_object(b"not a commit", "blob")
+    with pytest.raises(ObjectCorruptError):
+        m.integrate_fetched_tip("feature", blob)
+    assert m.read_ref("main") == local
+    assert m.read_ref("feature") is None
+
+
+def test_integrate_rejects_invalid_branch_names(tmp_path):
+    """Traversal, absolute paths, and protocol control characters are refused."""
+    m = make_manager(tmp_path)
+    tip = m.create_commit(make_tree(m), [], AUTHOR, "tip")
+    for name in ["", "..", "../x", "/abs", "a/../../b", "bad\nname", "bad\0name", "a\\b"]:
+        with pytest.raises(MiniGitError):
+            m.integrate_fetched_tip(name, tip)
+    assert m.read_ref("main") == tip
+    assert sorted(path.name for path in (tmp_path / ".minigit" / "refs" / "heads").iterdir()) == [
+        "main"
+    ]
+
+
+def test_failed_ref_publish_leaves_old_ref_readable(tmp_path, monkeypatch):
+    """A failed os.replace keeps the previous ref text."""
+    m = make_manager(tmp_path)
+    tree = make_tree(m)
+    local = m.create_commit(tree, [], AUTHOR, "local")
+    remote = m.create_commit(tree, [local], AUTHOR, "remote")
+    m.write_ref("main", local)
+
+    def fail_replace(src, dst):
+        """Simulate a publish that does not reach the ref file."""
+        raise OSError("replace failed")
+
+    monkeypatch.setattr("minigit.commits.os.replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        m.integrate_fetched_tip("main", remote)
+    ref = tmp_path / ".minigit" / "refs" / "heads" / "main"
+    assert ref.read_text().strip() == local
+
+
+def test_pending_merge_blocks_integrate(tmp_path):
+    """A second integration is refused while conflict state is still saved."""
+    m = make_manager(tmp_path)
+    local, fetched = setup_diverged(
+        m,
+        {"file.txt": "x\n"},
+        {"file.txt": "ours\n"},
+        {"file.txt": "theirs\n"},
+    )
+    with pytest.raises(MergeConflictError):
+        m.integrate_fetched_tip("main", fetched)
+    with pytest.raises(MiniGitError, match="merge in progress"):
+        m.integrate_fetched_tip("main", fetched)
+    assert m.read_ref("main") == local
+    assert m.read_ref("feature") == fetched
+
+
+def test_integrate_conflict_resolves_across_fresh_processes(tmp_path, monkeypatch):
+    """Resolve, add, and commit in a new process keep parents [local, fetched]."""
+    monkeypatch.chdir(tmp_path)
+    m = make_real_manager(tmp_path)
+    base = commit_file(m, "file.txt", "x\n", "base")
+    m.create_branch("feature", base)
+    local = commit_file(m, "file.txt", "ours\n", "ours")
+    m.switch_branch("feature")
+    fetched = commit_file(m, "file.txt", "theirs\n", "theirs")
+    m.switch_branch("main")
+    with pytest.raises(MergeConflictError):
+        CommitManager(str(tmp_path)).integrate_fetched_tip("main", fetched)
+    assert main(["commit", "-m", "too-soon"]) == 1
+    (tmp_path / "file.txt").write_text("resolved\n")
+    assert main(["add", "file.txt"]) == 0
+    assert main(["commit", "-m", "unused"]) == 0
+    fresh = CommitManager(str(tmp_path))
+    assert fresh.read_commit(fresh.read_ref("main")).parents == [local, fetched]
+    assert not (tmp_path / ".minigit" / "MERGE_HEAD").exists()
+
+
+@pytest.mark.parametrize("name", ["bad name", "bad\tname", "bad\x1bname", "bad\x7fname"])
+def test_ref_names_reject_protocol_whitespace_and_controls(tmp_path, name):
+    manager = make_manager(tmp_path)
+    with pytest.raises(MiniGitError, match="invalid branch name"):
+        manager.write_ref(name, "a" * 40)
+    assert manager.list_branches() == []
+
+
+def test_nested_branches_are_listed_without_temporary_files(tmp_path):
+    manager = make_manager(tmp_path)
+    tip = manager.create_commit(make_tree(manager), [], AUTHOR, "base")
+    manager.create_branch("feature/topic", tip)
+    (tmp_path / ".minigit/refs/heads/.main.pending").write_text(tip)
+    assert manager.list_branches() == ["feature/topic", "main"]
+    assert manager.read_ref("feature/topic") == tip
+
+
+def test_ref_paths_reject_symlinks_and_file_directory_collisions(tmp_path):
+    manager = make_manager(tmp_path)
+    tip = manager.create_commit(make_tree(manager), [], AUTHOR, "base")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "topic").write_text("untouched")
+    (tmp_path / ".minigit/refs/heads/escape").symlink_to(outside, target_is_directory=True)
+    for name in ["escape/topic", "main/topic"]:
+        with pytest.raises(MiniGitError):
+            manager.write_ref(name, tip)
+    manager.create_branch("feature/topic", tip)
+    with pytest.raises(MiniGitError):
+        manager.read_ref("feature")
+    assert (outside / "topic").read_text() == "untouched"
+    assert manager.list_branches() == ["feature/topic", "main"]

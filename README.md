@@ -63,7 +63,18 @@ minigit status            # clean
 Checkout restores files, executable modes, and the index. It rejects staged or
 unstaged changes and untracked paths that would be overwritten. Fast-forward
 merges keep HEAD on the current branch and create no additional commit.
-Diverged branches report that three-way merging is not implemented yet.
+Diverged branches use Myers line edits for a three-way merge. Disjoint text edits
+produce a commit with both parents. Conflicts write markers and leave branch refs
+unchanged. Edit each conflicted file, run `minigit add <path>`, then
+`minigit commit -m "Resolve merge"`. To resolve by deleting a file, remove it and
+add its path. Pending conflicts survive new CLI processes and block another
+merge, checkout, or commit until explicitly resolved.
+
+`minigit diff` shows line changes between HEAD and working files, including
+untracked files, binary changes, executable modes, and missing final newlines.
+`minigit status` retains its staged / not staged / untracked sections. Both
+commands are read-only. Object storage also supports local
+[packfiles](docs/packfiles.md) without changing object hashes.
 
 To test push, initialize another scratch repository and run
 `minigit serve --port 9418 --token demo-token` there. From the first repository,

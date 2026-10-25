@@ -184,12 +184,14 @@ class CommitManager:
         with open(ref_path) as f:
             return f.read().strip()
 
-    def validate_branch_name(self, name: str) -> None:
+    @staticmethod
+    def validate_branch_name(name: str) -> None:
         """Reject a branch name that escapes refs/heads or breaks the ref line."""
         if (
             not name
-            or any(part in {"", ".", ".."} for part in name.split("/"))
-            or any(char in name for char in "\0\\\r\n")
+            or any(not part or part.startswith(".") for part in name.split("/"))
+            or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in name)
+            or "\\" in name
         ):
             raise MiniGitError(f"invalid branch name: {name!r}")
 
@@ -220,7 +222,18 @@ class CommitManager:
     def _ref_path(self, name: str) -> str:
         """Return the file path for a single branch's ref."""
         self.validate_branch_name(name)
-        return os.path.join(self._refs_dir(), name)
+        path = self.root
+        parts = [".minigit", "refs", "heads", *name.split("/")]
+        for index, part in enumerate(parts):
+            path = os.path.join(path, part)
+            if os.path.islink(path):
+                raise MiniGitError(f"symlink in ref path: {name!r}")
+            if os.path.exists(path):
+                if index < len(parts) - 1 and not os.path.isdir(path):
+                    raise MiniGitError(f"ref path is blocked: {name!r}")
+                if index == len(parts) - 1 and not os.path.isfile(path):
+                    raise MiniGitError(f"ref path is not a file: {name!r}")
+        return path
 
     def write_ref(self, name: str, commit_hash: str) -> None:
         """Point a branch ref at commit_hash.
@@ -266,6 +279,7 @@ class CommitManager:
 
     def write_head(self, name: str) -> None:
         """Point HEAD at the given branch."""
+        self._ref_path(name)
         with open(self._head_path(), "w") as f:
             f.write(f"ref: refs/heads/{name}\n")
 
@@ -399,10 +413,22 @@ class CommitManager:
         self.write_ref(name, commit_hash)
 
     def list_branches(self) -> list[str]:
-        if not os.path.isdir(self._refs_dir()):
-            return []
-        else:
-            return sorted(os.listdir(self._refs_dir()))
+        branches = []
+        for directory, dirnames, filenames in os.walk(self._refs_dir()):
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if not name.startswith(".") and not os.path.islink(os.path.join(directory, name))
+            ]
+            for filename in filenames:
+                name = os.path.relpath(os.path.join(directory, filename), self._refs_dir())
+                name = name.replace(os.sep, "/")
+                try:
+                    self._ref_path(name)
+                except MiniGitError:
+                    continue
+                branches.append(name)
+        return sorted(branches)
 
     def merge(self, branch_name) -> str | None:
         """Fast-forward or three-way merge `branch_name` into the current branch.

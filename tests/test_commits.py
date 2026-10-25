@@ -1148,3 +1148,37 @@ def test_integrate_conflict_resolves_across_fresh_processes(tmp_path, monkeypatc
     fresh = CommitManager(str(tmp_path))
     assert fresh.read_commit(fresh.read_ref("main")).parents == [local, fetched]
     assert not (tmp_path / ".minigit" / "MERGE_HEAD").exists()
+
+
+@pytest.mark.parametrize("name", ["bad name", "bad\tname", "bad\x1bname", "bad\x7fname"])
+def test_ref_names_reject_protocol_whitespace_and_controls(tmp_path, name):
+    manager = make_manager(tmp_path)
+    with pytest.raises(MiniGitError, match="invalid branch name"):
+        manager.write_ref(name, "a" * 40)
+    assert manager.list_branches() == []
+
+
+def test_nested_branches_are_listed_without_temporary_files(tmp_path):
+    manager = make_manager(tmp_path)
+    tip = manager.create_commit(make_tree(manager), [], AUTHOR, "base")
+    manager.create_branch("feature/topic", tip)
+    (tmp_path / ".minigit/refs/heads/.main.pending").write_text(tip)
+    assert manager.list_branches() == ["feature/topic", "main"]
+    assert manager.read_ref("feature/topic") == tip
+
+
+def test_ref_paths_reject_symlinks_and_file_directory_collisions(tmp_path):
+    manager = make_manager(tmp_path)
+    tip = manager.create_commit(make_tree(manager), [], AUTHOR, "base")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "topic").write_text("untouched")
+    (tmp_path / ".minigit/refs/heads/escape").symlink_to(outside, target_is_directory=True)
+    for name in ["escape/topic", "main/topic"]:
+        with pytest.raises(MiniGitError):
+            manager.write_ref(name, tip)
+    manager.create_branch("feature/topic", tip)
+    with pytest.raises(MiniGitError):
+        manager.read_ref("feature")
+    assert (outside / "topic").read_text() == "untouched"
+    assert manager.list_branches() == ["feature/topic", "main"]

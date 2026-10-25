@@ -681,6 +681,9 @@ def cli_repo(tmp_path, monkeypatch):
         def get_head_tree(self):
             return state["head_tree"]
 
+        def _read_pending_merge(self):
+            return None
+
     fake = types.ModuleType("minigit.commits")
     fake.CommitManager = FakeCommitManager
     monkeypatch.setitem(sys.modules, "minigit.commits", fake)

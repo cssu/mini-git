@@ -1,46 +1,58 @@
-# Packfile proposal
+# Packfile storage
 
-Week 4 still writes loose objects. This proposal defines the starting point for
-Week 5; it does not change the current object API or introduce packed reads yet.
+`ObjectStore.pack_objects(hashes)` deduplicates selected objects, validates them
+through `read_object`, and returns `(pack_path, index_path)`. Loose originals
+remain in place; new objects are written loose. Pruning and delta compression
+are not implemented.
 
-## Records and index
+```python
+from minigit.objects import ObjectStore
 
-Store immutable `pack-<id>.pack` and `pack-<id>.idx` pairs under
-`.minigit/objects/pack/`. Use a versioned pack header and an object count. Each
-record contains its object type, uncompressed byte length, compressed byte
-length, and independently zlib-compressed payload. Lengths and offsets use a
-fixed-width unsigned integer encoding with a documented byte order.
+store = ObjectStore(".")
+blob = store.write_object(b"hello\n", "blob")
+pack_path, index_path = store.pack_objects([blob, blob])
+assert store.read_object(blob) == ("blob", b"hello\n")
+```
 
-The versioned index maps each full lowercase SHA-1 hash to its record's byte
-offset and total length. Sort index entries by hash and reject duplicates,
-invalid hashes, out-of-bounds offsets, overlapping records, and unsupported
-versions. Independent record compression permits direct reads without
-inflating the whole pack. Delta compression is outside the initial scope.
+## Binary format (version 1)
+
+Immutable `pack-<id>.pack` and `pack-<id>.idx` pairs live under
+`.minigit/objects/pack/`. All integers are unsigned and big-endian; there is no
+alignment padding. Offsets are measured in bytes from the start of the pack.
+
+| Structure | Fields, in order |
+| --- | --- |
+| Pack header (12 bytes) | `MGPK` (4 bytes), version (uint32), object count (uint32) |
+| Record header (17 bytes) | type length (uint8), raw length (uint64), compressed length (uint64) |
+| Record body | ASCII type (`blob`, `tree`, or `commit`), then one zlib-compressed payload |
+| Index header (12 bytes) | `MGIX` (4 bytes), version (uint32), entry count (uint32) |
+| Index entry (36 bytes) | raw SHA-1 (20 bytes), record offset (uint64), total record length (uint64) |
+
+Index entries are sorted by hash and cover every pack record exactly once.
+Records preserve each object's type and exact original bytes; hashes remain
+SHA-1 of `type + space + byte_length + NUL + data`.
 
 ## Lookup and validation
 
-Keep `read_object(hash) -> (type, bytes)` unchanged. Validate the hash before
-lookup, try the loose-object path first, then search published pack indexes.
-A missing loose file falls back to packs; a corrupt loose object raises
-`ObjectCorruptError` rather than silently hiding the corruption. No match in
-either storage form raises `ObjectNotFoundError`.
+`read_object(hash) -> (type, bytes)` checks loose storage first, then published
+indexes in filename order. A missing loose file falls back to packs. Corrupt
+loose objects raise `ObjectCorruptError` without falling back. A hash absent
+from both storage forms raises `ObjectNotFoundError`.
 
-For packed reads, validate record boundaries, type, lengths, zlib end-of-stream,
-and the existing SHA-1 calculation over `type + space + byte_length + NUL + data`.
-Hashes and exact bytes must remain identical to loose storage. Keep
-`has_object` based on `read_object`, propagating corruption errors. Duplicate
-writes should also validate an existing packed object before returning.
+Packed lookup validates versions, counts, ordering, record boundaries, offsets,
+lengths, and complete index coverage. Reading a selected record also validates
+its type, zlib end-of-stream, uncompressed length, and hash. Duplicate writes and
+`has_object` use the same validation and work for packed-only objects. An invalid
+published index raises `ObjectCorruptError`; it is not silently ignored.
 
 ## Publication and compatibility
 
-Deduplicate requested hashes and read all source objects through `read_object`.
-Write the pack and index to temporary files beside their final destinations.
-Close and validate both, rename the pack first, then publish the index last.
-Readers discover only finalized indexes, so an interrupted publication cannot
-expose a partial pack. Use unique immutable pair names; an orphaned pack is
-ignored until cleanup. Clean temporary files on failure.
+Both temporary files are closed and validated before publication. The pack is
+renamed first, then the index is published last. Readers discover only finalized
+indexes, so interruption cannot expose a partially written pack. Unique immutable
+names prevent overwriting existing pairs. Temporary files are removed on failure;
+an orphaned pack without an index is ignored. Loose originals remain readable.
 
-Keep loose originals and allow new writes to remain loose. Pruning is a later
-feature. Tests should cover packed-only and mixed storage, fresh store instances,
-empty/binary/Unicode payloads, duplicate hashes, bad offsets, truncated records,
-broken compression, wrong hashes, and interrupted publication.
+History, checkout, diff, merge, and networking use the same object API for loose,
+packed, and mixed storage. Packfiles are a local storage format: push continues
+to transfer validated individual objects through the existing protocol.

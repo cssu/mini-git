@@ -11,6 +11,7 @@ Build the `WorkingTree` class here, per the interface contract.
 
 import os
 import re
+import stat
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -178,6 +179,14 @@ class WorkingTree:
 
         self.store = store
 
+    @staticmethod
+    def _file_mode(path: str) -> str:
+        if os.stat(path).st_mode & stat.S_IXUSR:
+            return "100755"
+        if os.name == "nt" and os.path.splitext(path)[1].lower() in {".bat", ".cmd", ".exe", ".sh"}:
+            return "100755"
+        return "100644"
+
     def read_index(self) -> list[IndexEntry]:
         if not os.path.exists(self.index_path):
             return []
@@ -206,14 +215,13 @@ class WorkingTree:
 
     def stage_file(self, path) -> None:
         full_path = os.path.join(self.root, path)
-        rel_path = os.path.relpath(full_path, self.root)
-        rel_path = rel_path.replace(os.sep, "/")
 
+        rel_path = os.path.relpath(full_path, self.root).replace(os.sep, "/")
+        self._validate_checkout_path(rel_path)
         if not os.path.isfile(full_path):
-            # A tracked file that is gone from disk: staging it stages the deletion.
             entries = self.read_index()
-            remaining = [e for e in entries if e.path != rel_path]
-            if len(remaining) == len(entries):
+            remaining = [entry for entry in entries if entry.path != rel_path]
+            if os.path.lexists(full_path) or len(remaining) == len(entries):
                 raise MiniGitError(f"No such file: {path}")
             self.write_index(remaining)
             return
@@ -223,10 +231,7 @@ class WorkingTree:
 
         blob_hash = self.store.write_object(data, "blob")
 
-        if os.access(full_path, os.X_OK):
-            mode = "100755"
-        else:
-            mode = "100644"
+        mode = self._file_mode(full_path)
 
         entries = [e for e in self.read_index() if e.path != rel_path]
         entries.append(IndexEntry(mode, blob_hash, rel_path))
@@ -276,9 +281,6 @@ class WorkingTree:
         walk(tree_hash, "")
         return sorted(entries, key=lambda e: e.path)
 
-    def _disk_mode(self, full_path: str) -> str:
-        return "100755" if os.access(full_path, os.X_OK) else "100644"
-
     def _make_change(self, path, status, old_mode, new_mode, old_data, new_data) -> _FileChange:
         old_lines = _bytes_to_lines(old_data)
         new_lines = _bytes_to_lines(new_data)
@@ -311,7 +313,7 @@ class WorkingTree:
                 continue
             with open(full_path, "rb") as f:
                 new_data = f.read()
-            new_mode = self._disk_mode(full_path)
+            new_mode = self._file_mode(full_path)
             if self.store.hash_object(new_data, "blob") == entry.hash and new_mode == entry.mode:
                 continue
             _, old_data = self.store.read_object(entry.hash)
@@ -328,7 +330,7 @@ class WorkingTree:
                     continue
                 with open(full_path, "rb") as f:
                     new_data = f.read()
-                new_mode = self._disk_mode(full_path)
+                new_mode = self._file_mode(full_path)
                 changes.append(self._make_change(rel_path, "added", None, new_mode, b"", new_data))
 
         return sorted(changes, key=lambda c: c.path)
@@ -358,7 +360,7 @@ class WorkingTree:
                 with open(full_path, "rb") as f:
                     data = f.read()
                 current_hash = self.store.hash_object(data, "blob")
-                current_mode = "100755" if os.access(full_path, os.X_OK) else "100644"
+                current_mode = self._file_mode(full_path)
                 if current_hash != entry.hash or current_mode != entry.mode:
                     result.modified.append(entry.path)
 
@@ -408,7 +410,7 @@ class WorkingTree:
             with open(full_path, "rb") as f:
                 data = f.read()
             disk_hash = self.store.hash_object(data, "blob")
-            disk_mode = "100755" if os.access(full_path, os.X_OK) else "100644"
+            disk_mode = self._file_mode(full_path)
             if disk_hash != entry.hash or disk_mode != entry.mode:
                 raise MiniGitError(f"local changes would be lost: {entry.path}")
 
@@ -497,8 +499,25 @@ class WorkingTree:
 
 
 def cmd_add(args) -> int:
+    """Stage a path. During a merge, that path is marked resolved."""
     wt = WorkingTree()
-    wt.stage_file(args.path)
+    from minigit.commits import CommitManager
+
+    manager = CommitManager(wt.root, store=wt.store, tree=wt)
+    full_path = os.path.join(wt.root, args.path)
+    rel_path = os.path.relpath(full_path, wt.root).replace(os.sep, "/")
+    wt._validate_checkout_path(rel_path)
+    pending = manager._read_pending_merge()
+    # A delete/modify conflict can have no pre-merge index entry. Explicitly
+    # adding its absent path still resolves the conflict as a deletion.
+    missing_conflict = (
+        pending is not None and rel_path in pending[3] and not os.path.lexists(full_path)
+    )
+    if missing_conflict:
+        wt.write_index([entry for entry in wt.read_index() if entry.path != rel_path])
+    else:
+        wt.stage_file(args.path)
+    manager.mark_path_resolved(rel_path)
     return 0
 
 
@@ -509,7 +528,8 @@ def cmd_status(args) -> int:
 
     from minigit.commits import CommitManager
 
-    head_tree_hash = CommitManager(wt.root, store=wt.store, tree=wt).get_head_tree()
+    manager = CommitManager(wt.root, store=wt.store, tree=wt)
+    head_tree_hash = manager.get_head_tree()
     head_entries = wt.read_tree_entries(head_tree_hash) if head_tree_hash else []
     head_by_path = {e.path: e for e in head_entries}
 
@@ -533,12 +553,16 @@ def cmd_status(args) -> int:
             with open(full_path, "rb") as f:
                 data = f.read()
             current_hash = wt.store.hash_object(data, "blob")
-            current_mode = "100755" if os.access(full_path, os.X_OK) else "100644"
+            current_mode = wt._file_mode(full_path)
             if current_hash != entry.hash or current_mode != entry.mode:
                 not_staged_paths.add(entry.path)
 
+    pending = manager._read_pending_merge()
+    unresolved = set(pending[3]) if pending else set()
+    not_staged_paths.update(unresolved)
+
     # untracked: on disk, absent from the index
-    known_paths = set(index_by_path)
+    known_paths = set(index_by_path) | unresolved
     untracked_paths = set()
     for dirpath, dirnames, filenames in os.walk(wt.root):
         dirnames[:] = [d for d in dirnames if d != ".minigit"]

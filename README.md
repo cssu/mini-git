@@ -82,8 +82,10 @@ run `minigit push 127.0.0.1:9418 main --token demo-token`. Push transfers missin
 objects and advances the remote branch only after validating its history; it
 does not check out files or update the server's HEAD or index. Repeating the push
 reports that the branch is up to date. Use a disposable token for this local demo.
-Pull remains a handshake placeholder; fetching and restoring a branch through
-`minigit pull` is not implemented yet.
+From another initialized repository, run
+`minigit pull 127.0.0.1:9418 main --token demo-token` to fetch the complete history
+and restore the branch. See the network workflow below for multiple branches
+and conflict resolution.
 
 ## Layout
 
@@ -135,6 +137,35 @@ Three things run your code, and they run the same checks:
 A lint check catches unused imports, undefined names, and similar mistakes. A
 formatting check keeps everyone's code looking the same so diffs show real
 changes instead of whitespace. Tests are the ones you write in `tests/`.
+
+## Sharing Repos Over the Network
+
+One repo serves, others push and pull. Every command needs the server's
+token, which is never printed back. Use a disposable token for local examples;
+stop the server with Ctrl-C when finished.
+
+```bash
+# in the repo that acts as the remote
+minigit serve --port 9418 --token demo-token
+
+# in any other repo
+minigit ls-remote 127.0.0.1:9418 --token demo-token       # list the remote's branches
+minigit push 127.0.0.1:9418 main --token demo-token        # or --all for every local branch
+minigit fetch 127.0.0.1:9418 main --token demo-token       # download history only, no ref changes
+minigit pull 127.0.0.1:9418 main --token demo-token        # fetch, then integrate; or --all
+```
+
+- A push is rejected if the remote branch moved since you last synced
+  (`push rejected: ... - pull first`). Pull, merge, then push again.
+- Pull fetches and validates the whole history before changing anything.
+  If the transfer fails, your refs, HEAD, index, and files are untouched,
+  and running the same pull again reuses what already arrived.
+- Pulling a branch you don't have checked out creates or fast-forwards it
+  without touching your files. A diverged one is refused: check it out and
+  pull again to merge.
+- Pulling into the checked-out branch fast-forwards or merges it. If both
+  sides changed the same lines, pull stops with the conflicting paths; fix
+  the conflict markers, `minigit add` the files, and `minigit commit`.
 
 ## Docs
 

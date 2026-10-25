@@ -269,9 +269,11 @@ class RemoteClient:
             raise NetworkProtocolError(f"remote rejected {obj_hash}: {reply}")
 
     def pull(self, remote_address: str, branch: str, token: str) -> None:
-        """Fetch `branch` from the remote and update the matching local ref."""
+        """Fetch `branch` and its complete reachable object graph."""
 
         host, port = self._parse_address(remote_address)
+        if not _valid_branch(branch):
+            raise NetworkProtocolError(f"invalid branch name: {branch!r}")
         if len(token) == 0:
             raise NetworkProtocolError("pull needs a token: pass --token")
 
@@ -289,11 +291,65 @@ class RemoteClient:
 
             send_line(sock, f"REF {branch}")
             reply = receive_line(sock, buf)
-            remote_hash = reply.rsplit(" ", 1)[1]
-            print(f"remote {branch} is at {remote_hash}")
-            print("# Week 6 - same exchange in reverse")
+            fields = reply.split(" ")
+            if len(fields) != 3 or fields[:2] != ["REF", branch]:
+                raise NetworkProtocolError(f"invalid REF response: {reply!r}")
+            remote_hash = fields[2]
+            if remote_hash == "-":
+                raise NetworkProtocolError(f"remote branch {branch!r} has no commits")
+            if not _valid_hash(remote_hash):
+                raise NetworkProtocolError(f"invalid remote hash: {remote_hash!r}")
+
+            commits_to_visit = [remote_hash]
+            visited_commits: set[str] = set()
+            visited_trees: set[str] = set()
+            while commits_to_visit:
+                commit_hash = commits_to_visit.pop()
+                if commit_hash in visited_commits:
+                    continue
+                visited_commits.add(commit_hash)
+                self._ensure_pulled_object(sock, buf, commit_hash, "commit")
+                commit = self.commits.read_commit(commit_hash)
+                commits_to_visit.extend(commit.parents)
+                self._pull_tree(sock, buf, commit.tree, visited_trees)
+
+            send_line(sock, "DONE")
+        except (OSError, ObjectNotFoundError, ObjectCorruptError) as exc:
+            raise NetworkProtocolError(f"pull from {host}:{port} failed: {exc}") from exc
         finally:
             sock.close()
+        self.commits.integrate_fetched_tip(branch, remote_hash)
+        print(f"{branch} now at {self.commits.read_ref(branch)}")
+
+    def _ensure_pulled_object(
+        self, sock, buf: bytearray, obj_hash: str, expected_type: str
+    ) -> None:
+        """Ensure an object exists locally and has its expected graph type."""
+
+        try:
+            obj_type, _ = self.store.read_object(obj_hash)
+        except ObjectNotFoundError:
+            send_line(sock, f"WANT {obj_hash}")
+            self._receive_object(sock, buf, obj_hash)
+            obj_type, _ = self.store.read_object(obj_hash)
+
+        if obj_type != expected_type:
+            raise ObjectCorruptError(obj_hash)
+
+    def _pull_tree(self, sock, buf: bytearray, tree_hash: str, visited: set[str]) -> None:
+        """Fetch a tree and all nested trees and blobs, once each."""
+
+        if tree_hash in visited:
+            return
+        visited.add(tree_hash)
+        self._ensure_pulled_object(sock, buf, tree_hash, "tree")
+        for entry in self.store.read_tree(tree_hash):
+            if entry.type == "tree":
+                self._pull_tree(sock, buf, entry.hash, visited)
+            elif entry.type == "blob":
+                self._ensure_pulled_object(sock, buf, entry.hash, "blob")
+            else:
+                raise ObjectCorruptError(entry.hash)
 
     def fetch_objects(self, remote_address: str, hashes: list[str], token: str) -> None:
         """Fetch each of `hashes` from the remote and write it into the local store.

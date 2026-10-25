@@ -272,6 +272,8 @@ class RemoteClient:
         """Fetch `branch` and its complete reachable object graph."""
 
         host, port = self._parse_address(remote_address)
+        if not _valid_branch(branch):
+            raise NetworkProtocolError(f"invalid branch name: {branch!r}")
         if len(token) == 0:
             raise NetworkProtocolError("pull needs a token: pass --token")
 
@@ -312,12 +314,12 @@ class RemoteClient:
                 self._pull_tree(sock, buf, commit.tree, visited_trees)
 
             send_line(sock, "DONE")
-            print(f"{branch} now at {remote_hash}")
         except (OSError, ObjectNotFoundError, ObjectCorruptError) as exc:
             raise NetworkProtocolError(f"pull from {host}:{port} failed: {exc}") from exc
         finally:
             sock.close()
-        self.commits.write_ref(branch, remote_hash)
+        self.commits.integrate_fetched_tip(branch, remote_hash)
+        print(f"{branch} now at {self.commits.read_ref(branch)}")
 
     def _ensure_pulled_object(
         self, sock, buf: bytearray, obj_hash: str, expected_type: str

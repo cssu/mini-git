@@ -9,7 +9,7 @@ import pytest
 
 from minigit.cli import main
 from minigit.commits import CommitManager
-from minigit.errors import NetworkProtocolError, ObjectNotFoundError
+from minigit.errors import MiniGitError, NetworkProtocolError, ObjectNotFoundError
 from minigit.objects import ObjectStore
 from minigit.objects import TreeEntry as RealTreeEntry
 from minigit.remote import RemoteClient, RemoteServer, receive_line, recv_exact, send_line
@@ -259,6 +259,34 @@ def test_pull_fetches_missing_descendants_from_packed_remote(tmp_path, push_pair
     assert destination_client.collect_reachable("main") == reachable
     for obj_hash in reachable:
         assert destination_store.read_object(obj_hash) == pair.local_store.read_object(obj_hash)
+
+
+def test_pull_restores_current_branch_before_advancing_ref(push_pair):
+    pair = push_pair
+    tip = _commit(pair.remote_store, pair.remote_commits, {"nested/file": b"fetched\n"}, [])
+    pair.client.pull(pair.address, "main", "tok")
+    assert pair.local_commits.read_ref("main") == tip
+    assert (Path(pair.client.repo_path) / "nested/file").read_bytes() == b"fetched\n"
+    assert (
+        pair.local_commits.tree.build_tree_from_index() == pair.remote_commits.read_commit(tip).tree
+    )
+
+
+def test_pull_preserves_dirty_work_and_ref(push_pair, capsys):
+    pair = push_pair
+    base = _commit(pair.remote_store, pair.remote_commits, {"file": b"base\n"}, [])
+    pair.client.pull(pair.address, "main", "tok")
+    path = Path(pair.client.repo_path) / "file"
+    path.write_bytes(b"local edit\n")
+    index_before = pair.local_commits.tree.read_index()
+    _commit(pair.remote_store, pair.remote_commits, {"file": b"remote edit\n"}, [base])
+    capsys.readouterr()
+    with pytest.raises(MiniGitError, match="local changes"):
+        pair.client.pull(pair.address, "main", "tok")
+    assert pair.local_commits.read_ref("main") == base
+    assert pair.local_commits.tree.read_index() == index_before
+    assert path.read_bytes() == b"local edit\n"
+    assert capsys.readouterr().out == ""
 
 
 def test_push_to_empty_branch_then_one_more_commit(push_pair):

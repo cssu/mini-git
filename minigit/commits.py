@@ -10,6 +10,7 @@ Build the `CommitManager` class here, per the interface contract.
 """
 
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 
@@ -183,15 +184,82 @@ class CommitManager:
         with open(ref_path) as f:
             return f.read().strip()
 
-    def write_ref(self, name: str, commit_hash: str) -> None:
-        """Point a branch's ref file at the given commit hash, creating refs/heads/ if needed"""
-        os.makedirs(self._refs_dir(), exist_ok=True)
-        with open(self._ref_path(name), "w") as f:
-            f.write(f"{commit_hash}\n")
+    @staticmethod
+    def validate_branch_name(name: str) -> None:
+        """Reject a branch name that escapes refs/heads or breaks the ref line."""
+        if (
+            not name
+            or any(not part or part.startswith(".") for part in name.split("/"))
+            or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in name)
+            or "\\" in name
+        ):
+            raise MiniGitError(f"invalid branch name: {name!r}")
+
+    def _validate_fetched_history(self, commit_hash: str) -> None:
+        """Require every commit, tree, and blob reachable from commit_hash.
+
+        Both parents are walked. A missing or corrupt object raises before a ref
+        or the work tree is updated.
+        """
+        visited_trees: set[str] = set()
+        for current in self.walk_history(commit_hash):
+            commit = self.read_commit(current)
+            self._validate_fetched_tree(commit.tree, visited_trees)
+
+    def _validate_fetched_tree(self, tree_hash: str, visited: set[str]) -> None:
+        """Check one tree and everything stored under it, once."""
+        if tree_hash in visited:
+            return
+        visited.add(tree_hash)
+        for entry in self.store.read_tree(tree_hash):
+            if entry.type == "tree":
+                self._validate_fetched_tree(entry.hash, visited)
+            else:
+                obj_type, _ = self.store.read_object(entry.hash)
+                if obj_type != "blob":
+                    raise ObjectCorruptError(entry.hash)
 
     def _ref_path(self, name: str) -> str:
-        """Return the file path for a single branch's ref"""
-        return os.path.join(self._refs_dir(), name)
+        """Return the file path for a single branch's ref."""
+        self.validate_branch_name(name)
+        path = self.root
+        parts = [".minigit", "refs", "heads", *name.split("/")]
+        for index, part in enumerate(parts):
+            path = os.path.join(path, part)
+            if os.path.islink(path):
+                raise MiniGitError(f"symlink in ref path: {name!r}")
+            if os.path.exists(path):
+                if index < len(parts) - 1 and not os.path.isdir(path):
+                    raise MiniGitError(f"ref path is blocked: {name!r}")
+                if index == len(parts) - 1 and not os.path.isfile(path):
+                    raise MiniGitError(f"ref path is not a file: {name!r}")
+        return path
+
+    def write_ref(self, name: str, commit_hash: str) -> None:
+        """Point a branch ref at commit_hash.
+
+        The new contents are written to a temporary file in the ref directory
+        and then published with os.replace. A failed publish leaves the previous
+        ref readable and removes the temporary file.
+        """
+        ref_path = self._ref_path(name)
+        os.makedirs(os.path.dirname(ref_path), exist_ok=True)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                dir=os.path.dirname(ref_path),
+                prefix=f".{os.path.basename(ref_path)}.",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = temporary_file.name
+                temporary_file.write(f"{commit_hash}\n")
+                temporary_file.flush()
+            os.replace(temporary_path, ref_path)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                os.unlink(temporary_path)
 
     def _head_path(self) -> str:
         """Return path of file that is the current branch"""
@@ -211,6 +279,7 @@ class CommitManager:
 
     def write_head(self, name: str) -> None:
         """Point HEAD at the given branch."""
+        self._ref_path(name)
         with open(self._head_path(), "w") as f:
             f.write(f"ref: refs/heads/{name}\n")
 
@@ -344,10 +413,22 @@ class CommitManager:
         self.write_ref(name, commit_hash)
 
     def list_branches(self) -> list[str]:
-        if not os.path.isdir(self._refs_dir()):
-            return []
-        else:
-            return sorted(os.listdir(self._refs_dir()))
+        branches = []
+        for directory, dirnames, filenames in os.walk(self._refs_dir()):
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if not name.startswith(".") and not os.path.islink(os.path.join(directory, name))
+            ]
+            for filename in filenames:
+                name = os.path.relpath(os.path.join(directory, filename), self._refs_dir())
+                name = name.replace(os.sep, "/")
+                try:
+                    self._ref_path(name)
+                except MiniGitError:
+                    continue
+                branches.append(name)
+        return sorted(branches)
 
     def merge(self, branch_name) -> str | None:
         """Fast-forward or three-way merge `branch_name` into the current branch.
@@ -375,6 +456,73 @@ class CommitManager:
             return None
 
         return self._three_way_merge(current_hash, target, branch_name)
+
+    def integrate_fetched_tip(self, branch_name: str, commit_hash: str) -> str | None:
+        """Integrate one fetched commit into a named local branch.
+
+        Inputs:
+            branch_name: the local branch to update.
+            commit_hash: the fetched commit, already stored in this repo.
+
+        Returns:
+            None when the ref is created, fast-forwarded, or left unchanged.
+            The new commit hash when the checked-out branch has a clean merge.
+
+        Errors:
+            MiniGitError for an invalid branch name, a merge already in progress,
+            staged changes on a checked-out update, unrelated history, multiple
+            merge bases, an unsupported conflict, or a diverged branch that is
+            not checked out. MergeConflictError for a text conflict on the
+            checked-out branch. ObjectNotFoundError or ObjectCorruptError when
+            the fetched history is missing or corrupt.
+
+        Local state:
+            Checked-out unborn branch, or local tip is an ancestor of the fetched
+            commit: check out the fetched tree, then move that branch ref. HEAD
+            stays on the branch.
+            Checked-out equal tips, or fetched commit is an ancestor of the local
+            tip: change nothing.
+            Checked-out divergence: the existing three-way merge. A clean result
+            has parents [local tip, fetched tip]. A text conflict leaves both
+            tips in place and saves both parents and the unresolved paths.
+            Absent branch that is not checked out: create its ref after history
+            validation. HEAD, files, and the index stay as they are.
+            Existing branch that is not checked out: fast-forward that ref, or
+            leave it, without changing HEAD, files, or the index.
+            Diverged branch that is not checked out: raise, with an instruction
+            to check out that branch and pull again.
+        """
+        self.validate_branch_name(branch_name)
+        if self._read_pending_merge() is not None:
+            raise MiniGitError("merge in progress")
+        self._validate_fetched_history(commit_hash)
+
+        local_hash = self.read_ref(branch_name)
+        checked_out = branch_name == self._current_branch()
+
+        if checked_out:
+            if local_hash is not None and (
+                commit_hash == local_hash or self.is_ancestor(commit_hash, local_hash)
+            ):
+                return None
+            if local_hash is None or self.is_ancestor(local_hash, commit_hash):
+                self._require_no_staged_changes()
+                self.tree.checkout(self.read_commit(commit_hash).tree)
+                self.write_ref(branch_name, commit_hash)
+                return None
+            return self._three_way_merge(local_hash, commit_hash, branch_name)
+
+        if local_hash is None:
+            self.write_ref(branch_name, commit_hash)
+            return None
+        if commit_hash == local_hash or self.is_ancestor(commit_hash, local_hash):
+            return None
+        if self.is_ancestor(local_hash, commit_hash):
+            self.write_ref(branch_name, commit_hash)
+            return None
+        raise MiniGitError(
+            f"branch '{branch_name}' has diverged; check out that branch and pull again"
+        )
 
     def find_merge_base(self, ours: str, theirs: str) -> str:
         """Return the single lowest common ancestor of two commits."""

@@ -13,8 +13,6 @@ from minigit.errors import (
     MergeConflictError,
     MiniGitError,
     NetworkProtocolError,
-    ObjectCorruptError,
-    ObjectNotFoundError,
 )
 from minigit.objects import ObjectStore
 from minigit.objects import TreeEntry as RealTreeEntry
@@ -1043,57 +1041,23 @@ def _commit_on(
     return commit_hash
 
 
-class FakeIntegratingCommitManager(CommitManager):
-    """Stands in for M3's #40 `integrate_fetched` until the real one lands.
-
-    Follows #40's spec: the checked-out branch is checked out + advanced on
-    a fast-forward, merged (here: a two-parent commit reusing the fetched
-    tree) on divergence, or raises `MergeConflictError` when told to; other
-    branches are created or fast-forwarded by ref only, and rejected when
-    diverged. Records each call and whether the fetched history was
-    complete at that moment.
-    """
+class RecordingCommitManager(CommitManager):
+    """Run the real merge engine and record whether fetched history was complete."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.calls: list[tuple[str, str, bool]] = []
-        self.conflict_paths: list[str] = []
 
-    def _history_complete(self, tip: str) -> bool:
-        try:
-            for commit_hash in self.walk_history(tip):
-                self.tree.read_tree_entries(self.read_commit(commit_hash).tree)
-            return True
-        except (ObjectNotFoundError, ObjectCorruptError):
-            return False
-
-    def integrate_fetched(self, branch: str, fetched_hash: str) -> str | None:
-        self.calls.append((branch, fetched_hash, self._history_complete(fetched_hash)))
-        local = self.read_ref(branch)
-        if local == fetched_hash or (local and self.is_ancestor(fetched_hash, local)):
-            return None
-        fast_forward = local is None or self.is_ancestor(local, fetched_hash)
-
-        if branch != self._current_branch():
-            if not fast_forward:
-                raise MiniGitError(f"{branch} diverged; check it out and pull again")
-            self.write_ref(branch, fetched_hash)
-            return None
-
-        if fast_forward:
-            self.tree.checkout(self.read_commit(fetched_hash).tree)
-            self.write_ref(branch, fetched_hash)
-            return None
-        if self.conflict_paths:
-            raise MergeConflictError(self.conflict_paths)
-        tree = self.read_commit(fetched_hash).tree
-        return self.create_commit(tree, [local, fetched_hash], "tester <t@example.com>", "merge")
+    def integrate_fetched_tip(self, branch: str, fetched_hash: str) -> str | None:
+        self._validate_fetched_history(fetched_hash)
+        self.calls.append((branch, fetched_hash, True))
+        return super().integrate_fetched_tip(branch, fetched_hash)
 
 
 @dataclass
 class PullPair:
     client: RemoteClient
-    local: FakeIntegratingCommitManager
+    local: RecordingCommitManager
     remote: CommitManager
     address: str
     local_root: Path
@@ -1101,12 +1065,12 @@ class PullPair:
 
 @pytest.fixture
 def pull_pair(tmp_path, push_pair):
-    """`push_pair`'s server, plus a fresh local repo whose M3 has `integrate_fetched`."""
+    """Use the real commit manager in a fresh local repository."""
 
     root = tmp_path / "puller"
     root.mkdir()
     store = ObjectStore(str(root))
-    local = FakeIntegratingCommitManager(str(root), store=store)
+    local = RecordingCommitManager(str(root), store=store)
     client = RemoteClient(repo_path=str(root), store=store, commits=local)
     return PullPair(client, local, push_pair.remote_commits, push_pair.address, root)
 
@@ -1357,6 +1321,7 @@ def test_pull_diverged_reports_merge_commit(pull_pair, capsys):
     pair.client.pull(pair.address, "main", "tok")
     local_tip = _commit_on(pair.local, "main", {"a.txt": b"base\n", "l.txt": b"l"}, [base], "l")
     remote_tip = _commit_on(pair.remote, "main", {"a.txt": b"base\n", "r.txt": b"r"}, [base], "r")
+    pair.local.tree.checkout(pair.local.read_commit(local_tip).tree)
 
     capsys.readouterr()
     pair.client.pull(pair.address, "main", "tok")
@@ -1371,7 +1336,7 @@ def test_pull_conflict_propagates_paths_and_keeps_ref(pull_pair):
     pair.client.pull(pair.address, "main", "tok")
     local_tip = _commit_on(pair.local, "main", {"a.txt": b"ours\n"}, [base], "ours")
     _commit_on(pair.remote, "main", {"a.txt": b"theirs\n"}, [base], "theirs")
-    pair.local.conflict_paths = ["a.txt"]
+    pair.local.tree.checkout(pair.local.read_commit(local_tip).tree)
 
     with pytest.raises(MergeConflictError) as info:
         pair.client.pull(pair.address, "main", "tok")
@@ -1392,9 +1357,8 @@ def test_pull_never_integrates_after_failed_fetch(pull_pair):
     assert pair.local.store.has_object(tip)  # complete objects kept for a retry
 
 
-def test_pull_without_m3_creates_and_fast_forwards_inactive_branch(push_pair):
+def test_pull_creates_and_fast_forwards_inactive_branch(push_pair):
     pair = push_pair
-    assert not hasattr(pair.local_commits, "integrate_fetched")
     f1 = _commit_on(pair.remote_commits, "feature", {"f.txt": b"1"}, [], "f1")
     pair.client.pull(pair.address, "feature", "tok")
     assert pair.local_commits.read_ref("feature") == f1
@@ -1405,26 +1369,24 @@ def test_pull_without_m3_creates_and_fast_forwards_inactive_branch(push_pair):
     assert not (Path(pair.client.repo_path) / "f.txt").exists()  # no checkout
 
 
-def test_pull_without_m3_rejects_diverged_inactive_branch(push_pair):
+def test_pull_rejects_diverged_inactive_branch(push_pair):
     pair = push_pair
     base = _commit_on(pair.remote_commits, "feature", {"f.txt": b"base"}, [], "base")
     pair.client.pull(pair.address, "feature", "tok")
     local_tip = _commit_on(pair.local_commits, "feature", {"f.txt": b"ours"}, [base], "ours")
     _commit_on(pair.remote_commits, "feature", {"f.txt": b"theirs"}, [base], "theirs")
 
-    with pytest.raises(MiniGitError, match="check out feature and pull again"):
+    with pytest.raises(MiniGitError, match="check out that branch and pull again"):
         pair.client.pull(pair.address, "feature", "tok")
     assert pair.local_commits.read_ref("feature") == local_tip
 
 
-def test_pull_without_m3_refuses_checked_out_branch(push_pair):
+def test_pull_into_current_branch_uses_real_integration(push_pair):
     pair = push_pair
     tip = _commit_on(pair.remote_commits, "main", {"a.txt": b"1"}, [], "c")
-
-    with pytest.raises(MiniGitError, match="#40"):
-        pair.client.pull(pair.address, "main", "tok")
-    assert pair.local_commits.read_ref("main") is None
-    assert pair.local_store.has_object(tip)
+    pair.client.pull(pair.address, "main", "tok")
+    assert pair.local_commits.read_ref("main") == tip
+    assert (Path(pair.client.repo_path) / "a.txt").read_bytes() == b"1"
 
 
 def test_cli_ls_remote_and_push_all(push_pair, monkeypatch, capsys):
@@ -1448,12 +1410,13 @@ def test_cli_pull_all_reports_each_branch(push_pair, monkeypatch, capsys):
     feature_tip = _commit_on(pair.remote_commits, "feature", {"b.txt": b"2"}, [], "f")
     monkeypatch.chdir(pair.client.repo_path)
 
-    # main is the checked-out branch, which needs M3's #40 helper; feature still lands.
-    assert main(["pull", pair.address, "--all", "--token", "tok"]) == 1
+    assert main(["pull", pair.address, "--all", "--token", "tok"]) == 0
     out, err = capsys.readouterr()
     assert pair.local_commits.read_ref("feature") == feature_tip
     assert f"feature now at {feature_tip}" in out
-    assert "minigit: main:" in err
+    assert pair.local_commits.read_ref("main") == pair.remote_commits.read_ref("main")
+    assert (Path(pair.client.repo_path) / "a.txt").read_bytes() == b"1"
+    assert err == ""
 
 
 @pytest.mark.parametrize("args", [["push", "--all", "main"], ["push"], ["pull"]])

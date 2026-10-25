@@ -23,6 +23,8 @@ from minigit.errors import (
 )
 from minigit.objects import ObjectStore
 
+MAX_PROTOCOL_LINE_BYTES = 65536
+
 
 def send_line(sock, text: str) -> None:
     """Send one line of the wire protocol,"""
@@ -40,6 +42,8 @@ def receive_line(sock, buf: bytearray) -> str:
     """
 
     while b"\n" not in buf:
+        if len(buf) > MAX_PROTOCOL_LINE_BYTES:
+            raise NetworkProtocolError("protocol line is too long")
         chunk = sock.recv(4096)
         if not chunk:
             raise NetworkProtocolError("connection closed mid-line")
@@ -47,6 +51,8 @@ def receive_line(sock, buf: bytearray) -> str:
 
     line, _, rest = buf.partition(b"\n")
     buf[:] = rest
+    if len(line) > MAX_PROTOCOL_LINE_BYTES:
+        raise NetworkProtocolError("protocol line is too long")
     try:
         return line.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -85,11 +91,11 @@ def _valid_branch(name: str) -> bool:
     characters that would break a ref file or a protocol line.
     """
 
-    return (
-        bool(name)
-        and all(part not in {"", ".", ".."} for part in name.split("/"))
-        and not any(char in name for char in "\0\\\r\n ")
-    )
+    try:
+        CommitManager.validate_branch_name(name)
+    except MiniGitError:
+        return False
+    return True
 
 
 def _rejection_reason(reply: str) -> str:
@@ -150,7 +156,7 @@ class RemoteClient:
 
         host, port = parts
         if host and port:
-            if port.isnumeric():
+            if port.isascii() and port.isdigit() and len(port) <= 5:
                 int_port = int(port)
                 if 1 <= int_port <= 65535:
                     return host, int_port
@@ -167,6 +173,8 @@ class RemoteClient:
         host, port = self._parse_address(remote_address)
         if len(token) == 0:
             raise NetworkProtocolError(f"{operation} needs a token: pass --token")
+        if any(ord(char) < 32 or ord(char) == 127 for char in token):
+            raise NetworkProtocolError(f"{operation} token contains invalid control characters")
         return host, port
 
     @contextmanager
@@ -189,10 +197,11 @@ class RemoteClient:
             if receive_line(sock, buf) != "OK":
                 raise NetworkProtocolError(f"{operation} to {host}:{port}: authentication failed")
             yield sock, buf
-        except NetworkProtocolError:
-            raise
+        except NetworkProtocolError as exc:
+            raise NetworkProtocolError(str(exc).replace(token, "<redacted>")) from None
         except (OSError, ObjectNotFoundError, ObjectCorruptError) as exc:
-            raise NetworkProtocolError(f"{operation} to {host}:{port} failed: {exc}") from exc
+            reason = str(exc).replace(token, "<redacted>")
+            raise NetworkProtocolError(f"{operation} to {host}:{port} failed: {reason}") from None
         finally:
             sock.close()
 
@@ -224,8 +233,13 @@ class RemoteClient:
         """
 
         host, port = self._preflight(remote_address, token, "push")
+        if not _valid_branch(branch):
+            raise NetworkProtocolError(f"invalid branch name: {branch!r}")
 
-        local_hash = self.commits.read_ref(branch)
+        try:
+            local_hash = self.commits.read_ref(branch)
+        except (MiniGitError, OSError) as exc:
+            raise NetworkProtocolError(f"cannot read local branch {branch!r}: {exc}") from exc
         if local_hash is None:
             raise NetworkProtocolError(f"local branch {branch!r} has no commits to push")
 
@@ -345,35 +359,25 @@ class RemoteClient:
         return tip
 
     def _fetch_history(self, sock, buf: bytearray, tip: str) -> None:
-        """Make every object reachable from commit `tip` present locally, following all parents."""
-
-        seen: set[str] = set()
-        pending = [tip]
+        """Fetch the pinned graph once, checking each edge's expected object type."""
+        seen: dict[str, str] = {}
+        pending = [(tip, "commit")]
         while pending:
-            commit_hash = pending.pop()
-            if commit_hash in seen:
+            obj_hash, expected_type = pending.pop()
+            if obj_hash in seen:
+                if seen[obj_hash] != expected_type:
+                    raise NetworkProtocolError(
+                        f"object {obj_hash} is a {seen[obj_hash]}, expected a {expected_type}"
+                    )
                 continue
-            seen.add(commit_hash)
-
-            self._ensure_object(sock, buf, commit_hash, "commit")
-            commit = self.commits.read_commit(commit_hash)
-            self._fetch_tree(sock, buf, commit.tree, seen)
-            pending.extend(commit.parents)
-
-    def _fetch_tree(self, sock, buf: bytearray, tree_hash: str, seen: set[str]) -> None:
-        """Make `tree_hash` and everything nested under it present locally, once each."""
-
-        if tree_hash in seen:
-            return
-        seen.add(tree_hash)
-
-        self._ensure_object(sock, buf, tree_hash, "tree")
-        for entry in self.store.read_tree(tree_hash):
-            if entry.type == "tree":
-                self._fetch_tree(sock, buf, entry.hash, seen)
-            elif entry.hash not in seen:
-                seen.add(entry.hash)
-                self._ensure_object(sock, buf, entry.hash, "blob")
+            self._ensure_object(sock, buf, obj_hash, expected_type)
+            seen[obj_hash] = expected_type
+            if expected_type == "commit":
+                commit = self.commits.read_commit(obj_hash)
+                pending.extend((parent, "commit") for parent in commit.parents)
+                pending.append((commit.tree, "tree"))
+            elif expected_type == "tree":
+                pending.extend((entry.hash, entry.type) for entry in self.store.read_tree(obj_hash))
 
     def _ensure_object(self, sock, buf: bytearray, obj_hash: str, expected_type: str) -> None:
         """Request `obj_hash` unless it's already stored, and check it is an `expected_type`."""
@@ -392,7 +396,7 @@ class RemoteClient:
     def pull(self, remote_address: str, branch: str, token: str) -> None:
         """Fetch `branch` from the remote and integrate it into the local branch of that name.
 
-        Integration is Module 3's job (`integrate_fetched`, #40): it runs
+        Integration is Module 3's job (`integrate_fetched_tip`): it runs
         only after the fetched history is complete and validated, and a
         `MergeConflictError` from it propagates unchanged so the user sees
         the conflicting paths.
@@ -411,42 +415,8 @@ class RemoteClient:
             print(f"{branch} now at {after}")
 
     def _integrate(self, branch: str, fetched: str) -> str | None:
-        """Hand a fetched, validated tip to M3; returns a new merge commit hash or None."""
-
-        integrate_fetched = getattr(self.commits, "integrate_fetched", None)
-        if integrate_fetched is not None:
-            return integrate_fetched(branch, fetched)
-        return self._integrate_by_ref(branch, fetched)
-
-    def _integrate_by_ref(self, branch: str, fetched: str) -> None:
-        """Interim stand-in for M3's `integrate_fetched` until #40 lands.
-
-        Handles only the cases that are pure ref moves through M3's
-        `read_ref`/`write_ref`: no-op when local already contains the fetched
-        tip, and creating or fast-forwarding a branch that isn't checked
-        out. Anything needing a checkout or a merge is refused rather than
-        reimplemented here; the fetched objects stay stored either way.
-        """
-
-        local = self.commits.read_ref(branch)
-        if local == fetched or (local is not None and _is_ancestor(self.commits, fetched, local)):
-            return None
-
-        # M3 treats a repo with no HEAD file as being on `main`.
-        if branch == (self.commits.read_head() or "main"):
-            raise MiniGitError(
-                f"can't update checked-out branch {branch!r} yet: pulling into it needs "
-                "Module 3's fetched-tip integration (#40). The fetched history is stored "
-                "locally; pull again once that lands"
-            )
-        if local is not None and not _is_ancestor(self.commits, local, fetched):
-            raise MiniGitError(
-                f"local {branch} has diverged from the remote: "
-                f"check out {branch} and pull again to merge"
-            )
-
-        self.commits.write_ref(branch, fetched)
-        return None
+        """Hand a validated tip to M3, preserving its merge and checkout errors."""
+        return self.commits.integrate_fetched_tip(branch, fetched)
 
     def fetch_objects(self, remote_address: str, hashes: list[str], token: str) -> None:
         """Fetch each of `hashes` from the remote and write it into the local store.
@@ -481,7 +451,10 @@ class RemoteClient:
 
         obj_type, _, length_text = rest.partition(" ")
         if obj_type not in {"blob", "tree", "commit"} or not (
-            length_text.isascii() and length_text.isdigit()
+            length_text.isascii()
+            and length_text.isdigit()
+            and len(length_text) <= 20
+            and int(length_text) <= sys.maxsize
         ):
             raise NetworkProtocolError(f"malformed OBJ header: {header!r}")
 
@@ -599,7 +572,12 @@ class RemoteServer:
                     send_line(conn, f"ERR object validation failed: {exc}")
                 except OSError:
                     pass
-            except (NetworkProtocolError, OSError):
+            except MiniGitError:
+                try:
+                    send_line(conn, "ERR invalid repository state or protocol")
+                except OSError:
+                    pass
+            except OSError:
                 pass  # a bad client must not take down the server
             finally:
                 conn.close()
@@ -756,7 +734,10 @@ class RemoteServer:
 
         obj_type, _, length_text = rest.partition(" ")
         if obj_type not in {"blob", "tree", "commit"} or not (
-            length_text.isascii() and length_text.isdigit()
+            length_text.isascii()
+            and length_text.isdigit()
+            and len(length_text) <= 20
+            and int(length_text) <= sys.maxsize
         ):
             send_line(conn, "ERR malformed OBJ header")
             return False

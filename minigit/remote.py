@@ -24,6 +24,7 @@ from minigit.errors import (
 from minigit.objects import ObjectStore
 
 MAX_PROTOCOL_LINE_BYTES = 65536
+MAX_OBJECT_BYTES = 64 * 1024 * 1024
 
 
 def send_line(sock, text: str) -> None:
@@ -76,6 +77,27 @@ def recv_exact(sock, buf: bytearray, size: int) -> bytes:
     data = bytes(buf[:size])
     del buf[:size]
     return data
+
+
+def _parse_object_header(header: str) -> tuple[str, int] | None:
+    """Parse an OBJ header without accepting an unbounded receive size."""
+
+    command, _, rest = header.partition(" ")
+    if command != "OBJ":
+        return None
+    obj_type, separator, length_text = rest.partition(" ")
+    if (
+        not separator
+        or obj_type not in {"blob", "tree", "commit"}
+        or not length_text.isascii()
+        or not length_text.isdigit()
+        or len(length_text) > 20
+    ):
+        return None
+    length = int(length_text)
+    if length > MAX_OBJECT_BYTES:
+        return None
+    return obj_type, length
 
 
 def _valid_hash(value: str) -> bool:
@@ -303,6 +325,8 @@ class RemoteClient:
         """Send `PUT <hash>` followed by the object's `OBJ` header and bytes."""
 
         obj_type, content = self.store.read_object(obj_hash)
+        if len(content) > MAX_OBJECT_BYTES:
+            raise NetworkProtocolError(f"object {obj_hash} exceeds transfer size limit")
         send_line(sock, f"PUT {obj_hash}")
         send_line(sock, f"OBJ {obj_type} {len(content)}")
         sock.sendall(content)
@@ -451,16 +475,12 @@ class RemoteClient:
         if command != "OBJ":
             raise NetworkProtocolError(f"expected OBJ, got {header!r}")
 
-        obj_type, _, length_text = rest.partition(" ")
-        if obj_type not in {"blob", "tree", "commit"} or not (
-            length_text.isascii()
-            and length_text.isdigit()
-            and len(length_text) <= 20
-            and int(length_text) <= sys.maxsize
-        ):
+        parsed_header = _parse_object_header(header)
+        if parsed_header is None:
             raise NetworkProtocolError(f"malformed OBJ header: {header!r}")
+        obj_type, length = parsed_header
 
-        content = recv_exact(sock, buf, int(length_text))
+        content = recv_exact(sock, buf, length)
         if self.store.hash_object(content, obj_type) != expected_hash:
             raise NetworkProtocolError(f"object {expected_hash} failed hash verification")
         if expected_type is not None and obj_type != expected_type:
@@ -735,22 +755,16 @@ class RemoteServer:
             return False
 
         header = receive_line(conn, buf)
-        command, _, rest = header.partition(" ")
-        if command != "OBJ":
-            send_line(conn, "ERR expected OBJ")
+        parsed_header = _parse_object_header(header)
+        if parsed_header is None:
+            if not header.startswith("OBJ "):
+                send_line(conn, "ERR expected OBJ")
+            else:
+                send_line(conn, "ERR malformed OBJ header")
             return False
+        obj_type, length = parsed_header
 
-        obj_type, _, length_text = rest.partition(" ")
-        if obj_type not in {"blob", "tree", "commit"} or not (
-            length_text.isascii()
-            and length_text.isdigit()
-            and len(length_text) <= 20
-            and int(length_text) <= sys.maxsize
-        ):
-            send_line(conn, "ERR malformed OBJ header")
-            return False
-
-        content = recv_exact(conn, buf, int(length_text))
+        content = recv_exact(conn, buf, length)
         if self.store.hash_object(content, obj_type) != expected_hash:
             send_line(conn, f"ERR hash mismatch for {expected_hash}")
             return False
@@ -800,6 +814,9 @@ class RemoteServer:
             send_line(conn, f"ERR corrupt object {obj_hash}")
             return
 
+        if len(content) > MAX_OBJECT_BYTES:
+            send_line(conn, f"ERR object {obj_hash} exceeds transfer size limit")
+            return
         send_line(conn, f"OBJ {obj_type} {len(content)}")
         conn.sendall(content)
 

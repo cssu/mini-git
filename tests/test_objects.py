@@ -124,6 +124,59 @@ def test_has_object_distinguishes_missing_valid_and_corrupt(tmp_path: Path) -> N
         store.has_object(obj_hash)
 
 
+def test_corrupt_loose_object_wins_over_valid_packed_copy_with_fresh_store(
+    tmp_path: Path,
+) -> None:
+    """A corrupt loose object must not fall back to a valid packed copy."""
+    writer = ObjectStore(tmp_path)
+    obj_hash = writer.write_object(b"content", "blob")
+    writer.pack_objects([obj_hash])
+    writer._object_path(obj_hash).write_bytes(b"corrupt")
+
+    reader = ObjectStore(tmp_path)
+    with pytest.raises(ObjectCorruptError):
+        reader.read_object(obj_hash)
+    with pytest.raises(ObjectCorruptError):
+        reader.has_object(obj_hash)
+    with pytest.raises(ObjectCorruptError):
+        reader.write_object(b"content", "blob")
+
+
+@pytest.mark.parametrize(
+    ("storage", "expected"),
+    [
+        ("loose", ("blob", b"loose")),
+        ("packed", ("blob", b"packed")),
+        ("mixed", ("blob", b"loose")),
+    ],
+)
+def test_fresh_store_lookup_modes_preserve_missing_and_corrupt_distinctions(
+    tmp_path: Path, storage: str, expected: tuple[str, bytes]
+) -> None:
+    """Fresh stores distinguish valid, missing, and corrupt objects in each mode."""
+    writer = ObjectStore(tmp_path)
+    data = b"loose" if storage == "mixed" else storage.encode()
+    obj_hash = writer.write_object(data, "blob")
+    if storage in {"packed", "mixed"}:
+        writer.pack_objects([obj_hash])
+    if storage == "packed":
+        writer._object_path(obj_hash).unlink()
+
+    reader = ObjectStore(tmp_path)
+    assert reader.read_object(obj_hash) == expected
+    assert reader.has_object(obj_hash)
+    assert reader.write_object(data, "blob") == obj_hash
+    if storage == "packed":
+        assert not reader._object_path(obj_hash).exists()
+    with pytest.raises(ObjectNotFoundError):
+        reader.read_object("a" * 40)
+    assert not reader.has_object("a" * 40)
+
+    reader._object_path(obj_hash).write_bytes(b"corrupt")
+    with pytest.raises(ObjectCorruptError):
+        reader.read_object(obj_hash)
+
+
 def test_identical_objects_same_hash(tmp_path: Path):
     """
     Test that writing the same object twice returns the same hash.

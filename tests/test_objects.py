@@ -503,6 +503,70 @@ def test_corrupt_pack_record_is_reported(tmp_path: Path) -> None:
         store.read_object(obj_hash)
 
 
+def test_packed_lookup_validates_every_record_before_returning_any_object(tmp_path: Path) -> None:
+    """A corrupt non-selected record invalidates the published pack."""
+    store = ObjectStore(tmp_path)
+    first = store.write_object(b"first", "blob")
+    second = store.write_object(b"second", "blob")
+    pack_path, _ = store.pack_objects([first, second])
+    store._object_path(first).unlink()
+    store._object_path(second).unlink()
+
+    raw = bytearray(pack_path.read_bytes())
+    first_record_end = store._PACK_HEADER.size + store._RECORD_HEADER.size
+    type_length = raw[store._PACK_HEADER.size]
+    compressed_length = int.from_bytes(
+        raw[store._PACK_HEADER.size + 9 : store._PACK_HEADER.size + 17], "big"
+    )
+    second_record = first_record_end + type_length + compressed_length
+    raw[second_record + store._RECORD_HEADER.size + 4] ^= 0xFF
+    pack_path.write_bytes(raw)
+
+    with pytest.raises(ObjectCorruptError):
+        ObjectStore(tmp_path).read_object(first)
+
+
+@pytest.mark.parametrize("header", ["pack", "index"])
+def test_published_pack_and_index_versions_are_validated(tmp_path: Path, header: str) -> None:
+    store = ObjectStore(tmp_path)
+    obj_hash = store.write_object(b"content", "blob")
+    pack_path, index_path = store.pack_objects([obj_hash])
+    path = pack_path if header == "pack" else index_path
+    raw = bytearray(path.read_bytes())
+    version_offset = 4
+    raw[version_offset : version_offset + 4] = (store._PACK_VERSION + 1).to_bytes(4, "big")
+    path.write_bytes(raw)
+    store._object_path(obj_hash).unlink()
+
+    with pytest.raises(ObjectCorruptError):
+        ObjectStore(tmp_path).read_object(obj_hash)
+
+
+def test_published_pack_count_and_index_offset_are_validated(tmp_path: Path) -> None:
+    store = ObjectStore(tmp_path)
+    obj_hash = store.write_object(b"content", "blob")
+    pack_path, index_path = store.pack_objects([obj_hash])
+    store._object_path(obj_hash).unlink()
+
+    pack = bytearray(pack_path.read_bytes())
+    pack[8:12] = (2).to_bytes(4, "big")
+    pack_path.write_bytes(pack)
+    with pytest.raises(ObjectCorruptError):
+        ObjectStore(tmp_path).read_object(obj_hash)
+
+    offset_root = tmp_path / "offset"
+    offset_store = ObjectStore(offset_root)
+    obj_hash = offset_store.write_object(b"content", "blob")
+    pack_path, index_path = offset_store.pack_objects([obj_hash])
+    offset_store._object_path(obj_hash).unlink()
+    index = bytearray(index_path.read_bytes())
+    offset_start = offset_store._INDEX_HEADER.size + 20
+    index[offset_start : offset_start + 8] = (1).to_bytes(8, "big")
+    index_path.write_bytes(index)
+    with pytest.raises(ObjectCorruptError):
+        ObjectStore(offset_root).read_object(obj_hash)
+
+
 def test_bad_pack_index_is_reported(tmp_path: Path) -> None:
     """Tests that a bad pack index raises ObjectCorruptError when reading the object."""
     store = ObjectStore(tmp_path)
@@ -520,7 +584,7 @@ def test_bad_pack_index_is_reported(tmp_path: Path) -> None:
 def test_pack_publication_failure_leaves_previous_objects_readable(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """Tests that a failure during pack publication leaves previous objects readable."""
+    """A failed index publication leaves loose objects and no visible pack."""
     store = ObjectStore(tmp_path)
     obj_hash = store.write_object(b"content", "blob")
 
@@ -539,6 +603,35 @@ def test_pack_publication_failure_leaves_previous_objects_readable(
     with pytest.raises(OSError):
         store.pack_objects([obj_hash])
 
+    assert store.read_object(obj_hash) == ("blob", b"content")
+    pack_files = sorted(store.pack_dir.glob("pack-*"))
+    assert [path.suffix for path in pack_files] == [".pack"]
+    assert all(not path.name.startswith(".pack-") for path in pack_files)
+    assert not list(store.pack_dir.glob("*.idx"))
+    assert not list(store.pack_dir.glob("*.tmp"))
+
+    store._object_path(obj_hash).unlink()
+    with pytest.raises(ObjectNotFoundError):
+        ObjectStore(tmp_path).read_object(obj_hash)
+
+
+def test_pack_publication_failure_cleans_temporary_files(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A failure before pack publication removes both temporary files."""
+    store = ObjectStore(tmp_path)
+    obj_hash = store.write_object(b"content", "blob")
+
+    def fail_pack_validation(path):
+        raise OSError("simulated validation failure")
+
+    monkeypatch.setattr(store, "_validate_pack", fail_pack_validation)
+    with pytest.raises(OSError):
+        store.pack_objects([obj_hash])
+
+    assert not list(store.pack_dir.glob("pack-*.pack"))
+    assert not list(store.pack_dir.glob("pack-*.idx"))
+    assert not list(store.pack_dir.glob("*.tmp"))
     assert store.read_object(obj_hash) == ("blob", b"content")
 
 

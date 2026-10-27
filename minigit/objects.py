@@ -291,6 +291,11 @@ class ObjectStore:
                     or position + record_length > len(raw)
                 ):
                     raise ValueError
+                self._decode_packed_record(
+                    "",
+                    raw[position : position + record_length],
+                    verify_hash=False,
+                )
                 records.append((position, record_length))
                 position += record_length
             if position != len(raw):
@@ -300,10 +305,17 @@ class ObjectStore:
                 indexed_records = list(entries.values())
                 if set(indexed_records) != valid_records or len(indexed_records) != count:
                     raise ValueError
-        except (OSError, struct.error, ValueError) as error:
+                for obj_hash, (offset, record_length) in entries.items():
+                    self._decode_packed_record(
+                        obj_hash,
+                        raw[offset : offset + record_length],
+                    )
+        except (OSError, struct.error, ValueError, ObjectCorruptError) as error:
             raise ObjectCorruptError(pack_path.name) from error
 
-    def _decode_packed_record(self, obj_hash: str, record: bytes) -> tuple[str, bytes]:
+    def _decode_packed_record(
+        self, obj_hash: str, record: bytes, verify_hash: bool = True
+    ) -> tuple[str, bytes]:
         try:
             if len(record) < self._RECORD_HEADER.size:
                 raise ValueError
@@ -321,7 +333,9 @@ class ObjectStore:
             content = decompressor.decompress(compressed) + decompressor.flush()
             if not decompressor.eof or decompressor.unused_data or decompressor.unconsumed_tail:
                 raise ValueError
-            if len(content) != data_length or self.hash_object(content, obj_type) != obj_hash:
+            if len(content) != data_length or (
+                verify_hash and self.hash_object(content, obj_type) != obj_hash
+            ):
                 raise ValueError
         except (UnicodeDecodeError, ValueError, zlib.error) as error:
             raise ObjectCorruptError(obj_hash) from error

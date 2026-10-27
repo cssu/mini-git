@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from minigit.cli import main
+from minigit.commits import CommitManager
 from minigit.errors import ObjectCorruptError, ObjectNotFoundError
 from minigit.objects import ObjectStore, TreeEntry
 
@@ -479,6 +480,86 @@ def test_pack_objects_mixes_loose_and_packed_reads(tmp_path: Path) -> None:
     assert store.has_object(packed_hash)
 
 
+def test_fresh_store_reads_multiple_packs_and_object_types(tmp_path: Path) -> None:
+    """Read nested trees and a merge commit from overlapping packed and loose storage."""
+    writer = ObjectStore(tmp_path)
+    commits = CommitManager(tmp_path, store=writer)
+    objects = [
+        (b"", "blob"),
+        (b"\x00binary\xff", "blob"),
+        ("café".encode(), "blob"),
+    ]
+    hashes = [writer.write_object(data, obj_type) for data, obj_type in objects]
+    nested_hash = writer.write_tree([TreeEntry("100644", "blob", hashes[1], "binary")])
+    root_hash = writer.write_tree(
+        [
+            TreeEntry("100644", "blob", hashes[0], "empty"),
+            TreeEntry("40000", "tree", nested_hash, "nested"),
+            TreeEntry("100644", "blob", hashes[2], "unicode"),
+        ]
+    )
+    first_commit = commits.create_commit(root_hash, [], "tester <test@example.com>", "first")
+    side_commit = commits.create_commit(root_hash, [], "tester <test@example.com>", "side")
+    merge_commit = commits.create_commit(
+        root_hash,
+        [first_commit, side_commit],
+        "tester <test@example.com>",
+        "merge",
+    )
+
+    first_pack_objects = [hashes[0], nested_hash, root_hash, first_commit]
+    second_pack_objects = [root_hash, hashes[1], hashes[2], side_commit, merge_commit]
+    writer.pack_objects([*first_pack_objects, first_pack_objects[0]])
+    writer.pack_objects([*second_pack_objects, root_hash])
+    for obj_hash in set(first_pack_objects + second_pack_objects):
+        if obj_hash != hashes[2]:
+            writer._object_path(obj_hash).unlink()
+
+    reader = ObjectStore(tmp_path)
+    reader_commits = CommitManager(tmp_path, store=reader)
+    assert reader.read_object(hashes[0]) == ("blob", b"")
+    assert reader.read_object(hashes[1]) == ("blob", b"\x00binary\xff")
+    assert reader.read_object(hashes[2]) == ("blob", "café".encode())
+    assert reader.read_tree(root_hash) == [
+        TreeEntry("100644", "blob", hashes[0], "empty"),
+        TreeEntry("40000", "tree", nested_hash, "nested"),
+        TreeEntry("100644", "blob", hashes[2], "unicode"),
+    ]
+    assert reader.read_object(merge_commit)[0] == "commit"
+    assert reader_commits.read_commit(merge_commit).parents == [first_commit, side_commit]
+
+
+def test_packed_index_cache_discovers_new_packs(tmp_path: Path) -> None:
+    """A cached lookup still discovers a pack published after the first read."""
+    store = ObjectStore(tmp_path)
+    first_hash = store.write_object(b"first", "blob")
+    second_hash = store.write_object(b"second", "blob")
+    store.pack_objects([first_hash])
+    store._object_path(first_hash).unlink()
+
+    assert store.read_object(first_hash) == ("blob", b"first")
+
+    store.pack_objects([second_hash])
+    store._object_path(second_hash).unlink()
+    assert store.read_object(second_hash) == ("blob", b"second")
+
+
+def test_packed_index_cache_rechecks_changed_pack(tmp_path: Path) -> None:
+    """Changing a published pack invalidates its cached validation."""
+    store = ObjectStore(tmp_path)
+    obj_hash = store.write_object(b"content", "blob")
+    pack_path, _ = store.pack_objects([obj_hash])
+    store._object_path(obj_hash).unlink()
+
+    assert store.read_object(obj_hash) == ("blob", b"content")
+    raw = bytearray(pack_path.read_bytes())
+    raw[-1] ^= 0xFF
+    pack_path.write_bytes(raw)
+
+    with pytest.raises(ObjectCorruptError):
+        store.read_object(obj_hash)
+
+
 def test_duplicate_write_validates_packed_only_object(tmp_path: Path) -> None:
     store = ObjectStore(tmp_path)
     obj_hash = store.write_object(b"packed", "blob")
@@ -615,9 +696,7 @@ def test_pack_publication_failure_leaves_previous_objects_readable(
         ObjectStore(tmp_path).read_object(obj_hash)
 
 
-def test_pack_publication_failure_cleans_temporary_files(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_pack_publication_failure_cleans_temporary_files(tmp_path: Path, monkeypatch) -> None:
     """A failure before pack publication removes both temporary files."""
     store = ObjectStore(tmp_path)
     obj_hash = store.write_object(b"content", "blob")

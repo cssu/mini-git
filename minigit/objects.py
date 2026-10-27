@@ -49,6 +49,14 @@ class ObjectStore:
         self.root = Path(repo_path)
         self.objects_dir = self.root / ".minigit" / "objects"
         self.pack_dir = self.objects_dir / "pack"
+        self._index_cache: dict[
+            Path,
+            tuple[
+                tuple[int, int, int, int],
+                dict[str, tuple[int, int]],
+                Path,
+            ],
+        ] = {}
 
     def hash_object(self, data: bytes, obj_type: str) -> str:
         """
@@ -218,7 +226,7 @@ class ObjectStore:
         if not self.pack_dir.exists():
             return None
         for index_path in sorted(self.pack_dir.glob("pack-*.idx")):
-            entries, pack_path = self._read_index(index_path)
+            entries, pack_path = self._read_cached_index(index_path)
             entry = entries.get(obj_hash)
             if entry is None:
                 continue
@@ -231,6 +239,31 @@ class ObjectStore:
                 raise ObjectCorruptError(obj_hash) from error
             return self._decode_packed_record(obj_hash, record)
         return None
+
+    def _read_cached_index(self, index_path: Path) -> tuple[dict[str, tuple[int, int]], Path]:
+        """
+        Reads a cached index from the file system.
+        """
+        pack_path = index_path.with_suffix(".pack")
+        try:
+            index_stat = index_path.stat()
+            pack_stat = pack_path.stat()
+        except OSError as error:
+            raise ObjectCorruptError(index_path.name) from error
+
+        signature = (
+            index_stat.st_mtime_ns,
+            index_stat.st_size,
+            pack_stat.st_mtime_ns,
+            pack_stat.st_size,
+        )
+        cached = self._index_cache.get(index_path)
+        if cached is not None and cached[0] == signature:
+            return cached[1], cached[2]
+
+        entries, pack_path = self._read_index(index_path, pack_path)
+        self._index_cache[index_path] = (signature, entries, pack_path)
+        return entries, pack_path
 
     def _read_index(
         self, index_path: Path, pack_path: Path | None = None

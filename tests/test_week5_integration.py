@@ -84,7 +84,7 @@ def test_conflict_resolution_across_cli_processes(tmp_path, delete_ours, resolut
     commit = manager.read_commit(manager.read_ref("main"))
     assert commit.parents == parents
     assert commit.message == "Resolved by hand"
-    assert cli(tmp_path, "status").strip() == "clean"
+    assert cli(tmp_path, "status").strip() == "On branch main\nclean"
     assert not list((tmp_path / ".minigit").glob("MERGE_*"))
 
 
@@ -131,7 +131,7 @@ def test_packed_three_way_merge_push_and_stale_rejection(tmp_path):
         manager.store._object_path(obj_hash).unlink()
     cli(local, "merge", "feature")
     assert path.read_bytes() == b"A\nb\nC\n"
-    assert cli(local, "status").strip() == "clean"
+    assert cli(local, "status").strip() == "On branch main\nclean"
     assert cli(local, "diff") == ""
     tip = manager.read_ref("main")
     assert manager.read_commit(tip).parents == parents

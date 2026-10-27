@@ -16,7 +16,7 @@ def test_cli_commit_status_and_history(tmp_path, monkeypatch, capsys):
     assert main(["add", "src/hello.txt"]) == 0
     capsys.readouterr()
     assert main(["status"]) == 0
-    assert capsys.readouterr().out == "staged:\n  src/hello.txt\n"
+    assert capsys.readouterr().out == "On branch main\nno commits yet\nstaged:\n  src/hello.txt\n"
     assert main(["commit", "-m", "first"]) == 0
     manager = CommitManager(tmp_path)
     first = manager.read_ref("main")
@@ -26,12 +26,14 @@ def test_cli_commit_status_and_history(tmp_path, monkeypatch, capsys):
     assert manager.store.read_object(entries[0].hash) == ("blob", b"first")
     capsys.readouterr()
     assert main(["status"]) == 0
-    assert capsys.readouterr().out == "clean\n"
+    assert capsys.readouterr().out == "On branch main\nclean\n"
     file.write_text("second")
     assert main(["add", "src/hello.txt"]) == 0
     file.write_text("third")
     assert main(["status"]) == 0
-    assert capsys.readouterr().out == "staged:\n  src/hello.txt\nnot staged:\n  src/hello.txt\n"
+    assert capsys.readouterr().out == (
+        "On branch main\nstaged:\n  src/hello.txt\nnot staged:\n  src/hello.txt\n"
+    )
     assert main(["commit", "-m", "second"]) == 0
     second = manager.read_ref("main")
     assert manager.read_commit(second).parents == [first]

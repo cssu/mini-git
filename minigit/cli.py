@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from minigit import __version__, commits
-from minigit.errors import MiniGitError
+from minigit.errors import MergeConflictError, MiniGitError
 from minigit.index import register_index_commands
 from minigit.objects import register_subcommands as register_object_commands
 from minigit.remote import register_subcommands as register_remote_commands
@@ -89,6 +89,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         return handler(args)
+    except MergeConflictError as exc:
+        print(f"minigit: {exc}", file=sys.stderr)
+        print(
+            "resolve conflicts, run 'minigit add <path>', then 'minigit commit -m <message>'",
+            file=sys.stderr,
+        )
+        return 1
     except MiniGitError as exc:
         print(f"minigit: {exc}", file=sys.stderr)
         return 1

@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from minigit.cli import main
-from minigit.commits import CommitManager
+from minigit.commits import CommitManager, MergeResult, MergeStatus
 from minigit.errors import (
     MergeConflictError,
     MiniGitError,
@@ -185,6 +185,8 @@ def test_read_commit_round_trips_fields(tmp_path):
     assert c.parents == []
     assert c.author == AUTHOR
     assert c.committer == AUTHOR
+    assert isinstance(c.author_timestamp, int)
+    assert c.committer_timestamp == c.author_timestamp
     assert c.message == "init"
 
 
@@ -216,6 +218,17 @@ def test_read_commit_malformed_body_raises(tmp_path):
     bad = m.store.write_object(b"not a real commit", "commit")
     with pytest.raises(ObjectCorruptError):
         m.read_commit(bad)
+
+
+def test_read_commit_rejects_timestamp_outside_supported_date_range(tmp_path):
+    m = make_manager(tmp_path)
+    tree = make_tree(m)
+    timestamp = "9" * 100
+    body = f"tree {tree}\nauthor {AUTHOR} {timestamp}\ncommitter {AUTHOR} {timestamp}\n\nmessage"
+    commit_hash = m.store.write_object(body.encode(), "commit")
+
+    with pytest.raises(ObjectCorruptError):
+        m.read_commit(commit_hash)
 
 
 # testing get_head_tree
@@ -313,7 +326,7 @@ def test_branches_point_at_different_hashes_after_switch(tmp_path):
 
 
 # testing log
-def test_log_has_one_line_per_commit_newest_first(tmp_path):
+def test_log_has_one_entry_per_commit_newest_first(tmp_path):
     m = make_manager(tmp_path)
     tree = make_tree(m)
     first = m.create_commit(tree, [], AUTHOR, "first")
@@ -334,6 +347,88 @@ def test_log_shows_both_sides_of_merge_without_duplicates(tmp_path):
     lines = m.log()
     assert len(lines) == 4
     assert sum("base" in line for line in lines) == 1
+
+
+def test_log_detailed_output_has_full_metadata_and_unicode_message(tmp_path, monkeypatch):
+    monkeypatch.setattr("minigit.commits.time.time", lambda: 0)
+    m = make_manager(tmp_path)
+    commit_hash = m.create_commit(
+        make_tree(m), [], "Zoë <zoe@example.com>", "Résumé summary\n\nSecond line"
+    )
+
+    assert m.log() == [
+        f"commit {commit_hash}\n"
+        "Author: Zoë <zoe@example.com>\n"
+        "Date:   1970-01-01T00:00:00+00:00\n"
+        "\n"
+        "    Résumé summary\n"
+        "    \n"
+        "    Second line"
+    ]
+
+
+def test_log_detailed_merge_lists_both_full_parent_ids_in_order(tmp_path, monkeypatch):
+    monkeypatch.setattr("minigit.commits.time.time", lambda: 1)
+    m = make_manager(tmp_path)
+    tree = make_tree(m)
+    base = m.create_commit(tree, [], AUTHOR, "base")
+    left = m.create_commit(tree, [base], AUTHOR, "left")
+    right = m.create_commit(tree, [base], AUTHOR, "right")
+    merge = m.create_commit(tree, [left, right], AUTHOR, "merge")
+
+    assert f"Parents: {left} {right}" in m.log()[0]
+    assert m.log()[0].startswith(f"commit {merge}\n")
+
+
+def test_log_oneline_keeps_compact_summaries(tmp_path):
+    m = make_manager(tmp_path)
+    tree = make_tree(m)
+    first = m.create_commit(tree, [], AUTHOR, "first\nbody")
+    second = m.create_commit(tree, [first], AUTHOR, "second")
+
+    assert m.log(oneline=True) == [f"{second[:7]} second", f"{first[:7]} first"]
+
+
+def test_log_order_ignores_equal_and_skewed_timestamps(tmp_path, monkeypatch):
+    timestamps = iter([100, 100, 1_000_000, -50])
+    monkeypatch.setattr("minigit.commits.time.time", lambda: next(timestamps))
+    m = make_manager(tmp_path)
+    tree = make_tree(m)
+    base = m.create_commit(tree, [], AUTHOR, "base")
+    left = m.create_commit(tree, [base], AUTHOR, "left")
+    right = m.create_commit(tree, [base], AUTHOR, "right")
+    merge = m.create_commit(tree, [left, right], AUTHOR, "merge")
+
+    assert m.walk_history(merge) == [merge, left, base, right]
+    assert [entry.splitlines()[-1].strip() for entry in m.log()] == [
+        "merge",
+        "left",
+        "base",
+        "right",
+    ]
+
+
+def test_log_parses_each_reachable_commit_once(tmp_path, monkeypatch):
+    m = make_manager(tmp_path)
+    tree = make_tree(m)
+    base = m.create_commit(tree, [], AUTHOR, "base")
+    left = m.create_commit(tree, [base], AUTHOR, "left")
+    right = m.create_commit(tree, [base], AUTHOR, "right")
+    m.create_commit(tree, [left, right], AUTHOR, "merge")
+    original_read_object = m.store.read_object
+    commit_reads = 0
+
+    def counted_read_object(object_hash):
+        nonlocal commit_reads
+        result = original_read_object(object_hash)
+        if result[0] == "commit":
+            commit_reads += 1
+        return result
+
+    monkeypatch.setattr(m.store, "read_object", counted_read_object)
+
+    assert len(m.log()) == 4
+    assert commit_reads == 4
 
 
 def test_fresh_manager_reads_same_history(tmp_path):
@@ -539,6 +634,37 @@ def test_merge_same_tip_changes_nothing(tmp_path):
     assert m.read_ref("feature") == a
     assert m.read_head() == "main"
     assert m.tree.checked_out == []
+
+
+def test_merge_with_result_reports_up_to_date(tmp_path):
+    m = make_manager(tmp_path)
+    tip = m.create_commit(make_tree(m), [], AUTHOR, "tip")
+    m.create_branch("feature", tip)
+
+    assert m.merge_with_result("feature") == MergeResult("up-to-date")
+
+
+def test_merge_with_result_reports_fast_forward(tmp_path):
+    m = make_manager(tmp_path)
+    _, target = setup_fast_forward(m)
+
+    assert m.merge_with_result("feature") == MergeResult("fast-forward", target)
+
+
+def test_merge_with_result_reports_clean_merge(tmp_path):
+    m = make_manager(tmp_path)
+    ours, theirs = setup_diverged(
+        m,
+        {"shared.txt": "base\n"},
+        {"shared.txt": "base\n", "ours.txt": "ours\n"},
+        {"shared.txt": "base\n", "theirs.txt": "theirs\n"},
+    )
+
+    result = m.merge_with_result("feature")
+
+    assert result.outcome == "merged"
+    assert result.commit_hash is not None
+    assert m.read_commit(result.commit_hash).parents == [ours, theirs]
 
 
 def test_merge_already_merged_target_changes_nothing(tmp_path):
@@ -904,6 +1030,75 @@ def test_cli_conflict_then_resolve_add_commit(tmp_path, monkeypatch):
     commit = fresh.read_commit(fresh.read_ref("main"))
     assert commit.parents == [ours, theirs]
     assert not (tmp_path / ".minigit" / "MERGE_HEAD").exists()
+
+
+def test_get_merge_status_is_public_read_only_view(tmp_path):
+    m = make_manager(tmp_path)
+    ours, theirs = setup_diverged(
+        m,
+        {"file.txt": "base\n"},
+        {"file.txt": "ours\n"},
+        {"file.txt": "theirs\n"},
+    )
+
+    assert m.get_merge_status() is None
+    with pytest.raises(MergeConflictError) as info:
+        m.merge_with_result("feature")
+
+    assert info.value.paths == ["file.txt"]
+    status = m.get_merge_status()
+    assert status == MergeStatus(
+        ours=ours,
+        theirs=theirs,
+        message="Merge branch 'feature'",
+        unresolved_paths=("file.txt",),
+    )
+    with pytest.raises(AttributeError):
+        status.message = "changed"
+
+
+def test_get_merge_status_updates_after_path_is_resolved(tmp_path):
+    m = make_manager(tmp_path)
+    setup_diverged(
+        m,
+        {"file.txt": "base\n"},
+        {"file.txt": "ours\n"},
+        {"file.txt": "theirs\n"},
+    )
+    with pytest.raises(MergeConflictError):
+        m.merge("feature")
+
+    m.mark_path_resolved("file.txt")
+
+    assert m.get_merge_status().unresolved_paths == ()
+
+
+def test_log_and_branch_listing_leave_all_repository_state_unchanged(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    m = make_real_manager(tmp_path)
+    base = commit_file(m, "file.txt", "base\n", "base")
+    m.create_branch("feature", base)
+    commit_file(m, "file.txt", "main\n", "main")
+    m.switch_branch("feature")
+    commit_file(m, "file.txt", "feature\n", "feature")
+    m.switch_branch("main")
+    with pytest.raises(MergeConflictError):
+        m.merge("feature")
+
+    def snapshot():
+        return {
+            path.relative_to(tmp_path).as_posix(): path.read_bytes()
+            for path in tmp_path.rglob("*")
+            if path.is_file()
+        }
+
+    before = snapshot()
+    assert main(["log"]) == 0
+    assert main(["log", "--oneline"]) == 0
+    assert main(["branch"]) == 0
+    capsys.readouterr()
+
+    assert snapshot() == before
 
 
 # fetched-tip integration

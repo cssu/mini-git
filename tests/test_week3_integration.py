@@ -37,7 +37,7 @@ def test_cli_commit_status_and_history(tmp_path, monkeypatch, capsys):
     assert manager.read_commit(second).parents == [first]
     assert manager.store.read_object(entries[0].hash) == ("blob", b"first")
     capsys.readouterr()
-    assert main(["log"]) == 0
+    assert main(["log", "--oneline"]) == 0
     assert capsys.readouterr().out == f"{second[:7]} second\n{first[:7]} first\n"
 
 

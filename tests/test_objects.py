@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from minigit.cli import main
+from minigit.commits import CommitManager
 from minigit.errors import ObjectCorruptError, ObjectNotFoundError
 from minigit.objects import ObjectStore, TreeEntry
 
@@ -122,6 +123,59 @@ def test_has_object_distinguishes_missing_valid_and_corrupt(tmp_path: Path) -> N
     store._object_path(obj_hash).write_bytes(b"corrupt")
     with pytest.raises(ObjectCorruptError):
         store.has_object(obj_hash)
+
+
+def test_corrupt_loose_object_wins_over_valid_packed_copy_with_fresh_store(
+    tmp_path: Path,
+) -> None:
+    """A corrupt loose object must not fall back to a valid packed copy."""
+    writer = ObjectStore(tmp_path)
+    obj_hash = writer.write_object(b"content", "blob")
+    writer.pack_objects([obj_hash])
+    writer._object_path(obj_hash).write_bytes(b"corrupt")
+
+    reader = ObjectStore(tmp_path)
+    with pytest.raises(ObjectCorruptError):
+        reader.read_object(obj_hash)
+    with pytest.raises(ObjectCorruptError):
+        reader.has_object(obj_hash)
+    with pytest.raises(ObjectCorruptError):
+        reader.write_object(b"content", "blob")
+
+
+@pytest.mark.parametrize(
+    ("storage", "expected"),
+    [
+        ("loose", ("blob", b"loose")),
+        ("packed", ("blob", b"packed")),
+        ("mixed", ("blob", b"loose")),
+    ],
+)
+def test_fresh_store_lookup_modes_preserve_missing_and_corrupt_distinctions(
+    tmp_path: Path, storage: str, expected: tuple[str, bytes]
+) -> None:
+    """Fresh stores distinguish valid, missing, and corrupt objects in each mode."""
+    writer = ObjectStore(tmp_path)
+    data = b"loose" if storage == "mixed" else storage.encode()
+    obj_hash = writer.write_object(data, "blob")
+    if storage in {"packed", "mixed"}:
+        writer.pack_objects([obj_hash])
+    if storage == "packed":
+        writer._object_path(obj_hash).unlink()
+
+    reader = ObjectStore(tmp_path)
+    assert reader.read_object(obj_hash) == expected
+    assert reader.has_object(obj_hash)
+    assert reader.write_object(data, "blob") == obj_hash
+    if storage == "packed":
+        assert not reader._object_path(obj_hash).exists()
+    with pytest.raises(ObjectNotFoundError):
+        reader.read_object("a" * 40)
+    assert not reader.has_object("a" * 40)
+
+    reader._object_path(obj_hash).write_bytes(b"corrupt")
+    with pytest.raises(ObjectCorruptError):
+        reader.read_object(obj_hash)
 
 
 def test_identical_objects_same_hash(tmp_path: Path):
@@ -426,6 +480,86 @@ def test_pack_objects_mixes_loose_and_packed_reads(tmp_path: Path) -> None:
     assert store.has_object(packed_hash)
 
 
+def test_fresh_store_reads_multiple_packs_and_object_types(tmp_path: Path) -> None:
+    """Read nested trees and a merge commit from overlapping packed and loose storage."""
+    writer = ObjectStore(tmp_path)
+    commits = CommitManager(tmp_path, store=writer)
+    objects = [
+        (b"", "blob"),
+        (b"\x00binary\xff", "blob"),
+        ("café".encode(), "blob"),
+    ]
+    hashes = [writer.write_object(data, obj_type) for data, obj_type in objects]
+    nested_hash = writer.write_tree([TreeEntry("100644", "blob", hashes[1], "binary")])
+    root_hash = writer.write_tree(
+        [
+            TreeEntry("100644", "blob", hashes[0], "empty"),
+            TreeEntry("40000", "tree", nested_hash, "nested"),
+            TreeEntry("100644", "blob", hashes[2], "unicode"),
+        ]
+    )
+    first_commit = commits.create_commit(root_hash, [], "tester <test@example.com>", "first")
+    side_commit = commits.create_commit(root_hash, [], "tester <test@example.com>", "side")
+    merge_commit = commits.create_commit(
+        root_hash,
+        [first_commit, side_commit],
+        "tester <test@example.com>",
+        "merge",
+    )
+
+    first_pack_objects = [hashes[0], nested_hash, root_hash, first_commit]
+    second_pack_objects = [root_hash, hashes[1], hashes[2], side_commit, merge_commit]
+    writer.pack_objects([*first_pack_objects, first_pack_objects[0]])
+    writer.pack_objects([*second_pack_objects, root_hash])
+    for obj_hash in set(first_pack_objects + second_pack_objects):
+        if obj_hash != hashes[2]:
+            writer._object_path(obj_hash).unlink()
+
+    reader = ObjectStore(tmp_path)
+    reader_commits = CommitManager(tmp_path, store=reader)
+    assert reader.read_object(hashes[0]) == ("blob", b"")
+    assert reader.read_object(hashes[1]) == ("blob", b"\x00binary\xff")
+    assert reader.read_object(hashes[2]) == ("blob", "café".encode())
+    assert reader.read_tree(root_hash) == [
+        TreeEntry("100644", "blob", hashes[0], "empty"),
+        TreeEntry("40000", "tree", nested_hash, "nested"),
+        TreeEntry("100644", "blob", hashes[2], "unicode"),
+    ]
+    assert reader.read_object(merge_commit)[0] == "commit"
+    assert reader_commits.read_commit(merge_commit).parents == [first_commit, side_commit]
+
+
+def test_packed_index_cache_discovers_new_packs(tmp_path: Path) -> None:
+    """A cached lookup still discovers a pack published after the first read."""
+    store = ObjectStore(tmp_path)
+    first_hash = store.write_object(b"first", "blob")
+    second_hash = store.write_object(b"second", "blob")
+    store.pack_objects([first_hash])
+    store._object_path(first_hash).unlink()
+
+    assert store.read_object(first_hash) == ("blob", b"first")
+
+    store.pack_objects([second_hash])
+    store._object_path(second_hash).unlink()
+    assert store.read_object(second_hash) == ("blob", b"second")
+
+
+def test_packed_index_cache_rechecks_changed_pack(tmp_path: Path) -> None:
+    """Changing a published pack invalidates its cached validation."""
+    store = ObjectStore(tmp_path)
+    obj_hash = store.write_object(b"content", "blob")
+    pack_path, _ = store.pack_objects([obj_hash])
+    store._object_path(obj_hash).unlink()
+
+    assert store.read_object(obj_hash) == ("blob", b"content")
+    raw = bytearray(pack_path.read_bytes())
+    raw[-1] ^= 0xFF
+    pack_path.write_bytes(raw)
+
+    with pytest.raises(ObjectCorruptError):
+        store.read_object(obj_hash)
+
+
 def test_duplicate_write_validates_packed_only_object(tmp_path: Path) -> None:
     store = ObjectStore(tmp_path)
     obj_hash = store.write_object(b"packed", "blob")
@@ -450,6 +584,70 @@ def test_corrupt_pack_record_is_reported(tmp_path: Path) -> None:
         store.read_object(obj_hash)
 
 
+def test_packed_lookup_validates_every_record_before_returning_any_object(tmp_path: Path) -> None:
+    """A corrupt non-selected record invalidates the published pack."""
+    store = ObjectStore(tmp_path)
+    first = store.write_object(b"first", "blob")
+    second = store.write_object(b"second", "blob")
+    pack_path, _ = store.pack_objects([first, second])
+    store._object_path(first).unlink()
+    store._object_path(second).unlink()
+
+    raw = bytearray(pack_path.read_bytes())
+    first_record_end = store._PACK_HEADER.size + store._RECORD_HEADER.size
+    type_length = raw[store._PACK_HEADER.size]
+    compressed_length = int.from_bytes(
+        raw[store._PACK_HEADER.size + 9 : store._PACK_HEADER.size + 17], "big"
+    )
+    second_record = first_record_end + type_length + compressed_length
+    raw[second_record + store._RECORD_HEADER.size + 4] ^= 0xFF
+    pack_path.write_bytes(raw)
+
+    with pytest.raises(ObjectCorruptError):
+        ObjectStore(tmp_path).read_object(first)
+
+
+@pytest.mark.parametrize("header", ["pack", "index"])
+def test_published_pack_and_index_versions_are_validated(tmp_path: Path, header: str) -> None:
+    store = ObjectStore(tmp_path)
+    obj_hash = store.write_object(b"content", "blob")
+    pack_path, index_path = store.pack_objects([obj_hash])
+    path = pack_path if header == "pack" else index_path
+    raw = bytearray(path.read_bytes())
+    version_offset = 4
+    raw[version_offset : version_offset + 4] = (store._PACK_VERSION + 1).to_bytes(4, "big")
+    path.write_bytes(raw)
+    store._object_path(obj_hash).unlink()
+
+    with pytest.raises(ObjectCorruptError):
+        ObjectStore(tmp_path).read_object(obj_hash)
+
+
+def test_published_pack_count_and_index_offset_are_validated(tmp_path: Path) -> None:
+    store = ObjectStore(tmp_path)
+    obj_hash = store.write_object(b"content", "blob")
+    pack_path, index_path = store.pack_objects([obj_hash])
+    store._object_path(obj_hash).unlink()
+
+    pack = bytearray(pack_path.read_bytes())
+    pack[8:12] = (2).to_bytes(4, "big")
+    pack_path.write_bytes(pack)
+    with pytest.raises(ObjectCorruptError):
+        ObjectStore(tmp_path).read_object(obj_hash)
+
+    offset_root = tmp_path / "offset"
+    offset_store = ObjectStore(offset_root)
+    obj_hash = offset_store.write_object(b"content", "blob")
+    pack_path, index_path = offset_store.pack_objects([obj_hash])
+    offset_store._object_path(obj_hash).unlink()
+    index = bytearray(index_path.read_bytes())
+    offset_start = offset_store._INDEX_HEADER.size + 20
+    index[offset_start : offset_start + 8] = (1).to_bytes(8, "big")
+    index_path.write_bytes(index)
+    with pytest.raises(ObjectCorruptError):
+        ObjectStore(offset_root).read_object(obj_hash)
+
+
 def test_bad_pack_index_is_reported(tmp_path: Path) -> None:
     """Tests that a bad pack index raises ObjectCorruptError when reading the object."""
     store = ObjectStore(tmp_path)
@@ -467,7 +665,7 @@ def test_bad_pack_index_is_reported(tmp_path: Path) -> None:
 def test_pack_publication_failure_leaves_previous_objects_readable(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """Tests that a failure during pack publication leaves previous objects readable."""
+    """A failed index publication leaves loose objects and no visible pack."""
     store = ObjectStore(tmp_path)
     obj_hash = store.write_object(b"content", "blob")
 
@@ -486,6 +684,33 @@ def test_pack_publication_failure_leaves_previous_objects_readable(
     with pytest.raises(OSError):
         store.pack_objects([obj_hash])
 
+    assert store.read_object(obj_hash) == ("blob", b"content")
+    pack_files = sorted(store.pack_dir.glob("pack-*"))
+    assert [path.suffix for path in pack_files] == [".pack"]
+    assert all(not path.name.startswith(".pack-") for path in pack_files)
+    assert not list(store.pack_dir.glob("*.idx"))
+    assert not list(store.pack_dir.glob("*.tmp"))
+
+    store._object_path(obj_hash).unlink()
+    with pytest.raises(ObjectNotFoundError):
+        ObjectStore(tmp_path).read_object(obj_hash)
+
+
+def test_pack_publication_failure_cleans_temporary_files(tmp_path: Path, monkeypatch) -> None:
+    """A failure before pack publication removes both temporary files."""
+    store = ObjectStore(tmp_path)
+    obj_hash = store.write_object(b"content", "blob")
+
+    def fail_pack_validation(path):
+        raise OSError("simulated validation failure")
+
+    monkeypatch.setattr(store, "_validate_pack", fail_pack_validation)
+    with pytest.raises(OSError):
+        store.pack_objects([obj_hash])
+
+    assert not list(store.pack_dir.glob("pack-*.pack"))
+    assert not list(store.pack_dir.glob("pack-*.idx"))
+    assert not list(store.pack_dir.glob("*.tmp"))
     assert store.read_object(obj_hash) == ("blob", b"content")
 
 

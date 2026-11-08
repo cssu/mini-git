@@ -13,9 +13,17 @@ class MiniGitError(Exception):
 class ObjectNotFoundError(MiniGitError):
     """No object with the requested hash exists in the object store."""
 
+    def __init__(self, object_hash: str) -> None:
+        self.object_hash = object_hash
+        super().__init__(f"object not found: {object_hash}")
+
 
 class ObjectCorruptError(MiniGitError):
     """An object was found, but its bytes do not match its hash."""
+
+    def __init__(self, object_hash: str) -> None:
+        self.object_hash = object_hash
+        super().__init__(f"object corrupt: {object_hash}")
 
 
 class RefNotFoundError(MiniGitError):

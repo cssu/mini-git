@@ -50,13 +50,15 @@ minigit init
 printf 'A\n' > file.txt
 minigit add file.txt
 minigit commit -m "A"
+minigit log               # full ID, author, timezone-explicit date, message
+minigit log --oneline     # compact ID and first message line
 minigit branch feature
 minigit checkout feature
 printf 'B\n' > file.txt
 minigit add file.txt
 minigit commit -m "B"
 minigit checkout main     # file.txt contains A
-minigit merge feature     # fast-forward; file.txt contains B
+minigit merge feature     # reports a fast-forward; file.txt contains B
 minigit status            # clean
 ```
 
@@ -69,6 +71,20 @@ unchanged. Edit each conflicted file, run `minigit add <path>`, then
 `minigit commit -m "Resolve merge"`. To resolve by deleting a file, remove it and
 add its path. Pending conflicts survive new CLI processes and block another
 merge, checkout, or commit until explicitly resolved.
+
+`minigit log` follows both parents of merge commits. It prints the requested
+tip first, then visits parents in their stored order, and prints shared
+ancestors once. This ordering is deterministic and never uses commit
+timestamps to decide ancestry. Detailed output includes full commit and parent
+IDs; use `--oneline` for compact summaries. `log` and branch listing are
+read-only, including while a merge is pending.
+
+Branch, checkout, and merge commands distinguish created/already-current,
+up-to-date, fast-forward, clean-merge, and conflict outcomes. Expected failures
+use a concise `minigit: ...` message on stderr and a nonzero exit code; argument
+usage errors keep argparse's usage output and exit code 2. After a conflict,
+resolve each path, run `minigit add <path>`, then run
+`minigit commit -m "Resolve merge"`.
 
 `minigit diff` shows line changes between HEAD and working files, including
 untracked files, binary changes, executable modes, and missing final newlines.

@@ -13,6 +13,7 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from minigit.errors import (
     MergeConflictError,
@@ -64,6 +65,7 @@ def _cmd_branch(args) -> int:
         if commit_hash is None:
             raise MiniGitError(f"branch '{args.name}': '{current}' has no commits yet")
         manager.create_branch(args.name, commit_hash)
+        print(f"Created branch '{args.name}' at {commit_hash[:7]}.")
     else:
         for branch in manager.list_branches():
             if branch == current:
@@ -77,12 +79,12 @@ def _cmd_branch(args) -> int:
 def _cmd_log(args) -> int:
     """Handle the log command"""
     m = CommitManager()
-    lines = m.log()
+    lines = m.log(oneline=args.oneline)
     if not lines:
         print("no commits yet")
         return 0
-    for line in lines:
-        print(line)
+    separator = "\n" if args.oneline else "\n\n"
+    print(separator.join(lines))
     return 0
 
 
@@ -91,15 +93,25 @@ def _cmd_checkout(args) -> int:
     Handle 'minigit checkout <name> command'
     """
     manager = CommitManager()
+    already_current = manager._current_branch() == args.name
     manager.switch_branch(args.name)
-    print(f"Switched to branch '{args.name}'")
+    if already_current:
+        print(f"Already on branch '{args.name}'.")
+    else:
+        print(f"Switched to branch '{args.name}'.")
     return 0
 
 
 def _cmd_merge(args) -> int:
     manager = CommitManager()
-    manager.merge(args.branch)
-    print(f"Merged '{args.branch}' into '{manager._current_branch()}'")
+    current = manager._current_branch()
+    result = manager.merge_with_result(args.branch)
+    if result.outcome == "up-to-date":
+        print("Already up to date.")
+    elif result.outcome == "fast-forward":
+        print(f"Fast-forwarded '{current}' to '{args.branch}'.")
+    else:
+        print(f"Merged '{args.branch}' into '{current}' as {result.commit_hash[:7]}.")
     return 0
 
 
@@ -120,6 +132,7 @@ def register_subcommands(subparsers) -> None:
     checkout_parser.set_defaults(handler=_cmd_checkout)
 
     log_parser = subparsers.add_parser("log", help="show commit history")
+    log_parser.add_argument("--oneline", action="store_true", help="show compact summaries")
     log_parser.set_defaults(handler=_cmd_log)
 
     merge_parser = subparsers.add_parser("merge", help="merge a branch into the current branch")
@@ -128,12 +141,63 @@ def register_subcommands(subparsers) -> None:
 
 
 class CommitData:
-    def __init__(self, tree: str, parents: list[str], author: str, committer: str, message: str):
+    def __init__(
+        self,
+        tree: str,
+        parents: list[str],
+        author: str,
+        committer: str,
+        message: str,
+        author_timestamp: int = 0,
+        committer_timestamp: int = 0,
+    ):
         self.tree = tree
         self.parents = parents
         self.author = author
         self.committer = committer
         self.message = message
+        self.author_timestamp = author_timestamp
+        self.committer_timestamp = committer_timestamp
+
+
+@dataclass(frozen=True)
+class MergeResult:
+    """Outcome details for callers that need more than merge()'s legacy return value."""
+
+    outcome: str
+    commit_hash: str | None = None
+
+
+@dataclass(frozen=True)
+class MergeStatus:
+    """Read-only view of a pending merge owned by Module 3."""
+
+    ours: str
+    theirs: str
+    message: str
+    unresolved_paths: tuple[str, ...]
+
+
+def format_commit_summary(commit_hash: str, commit: CommitData) -> str:
+    """Return the compact, single-line presentation of a commit."""
+    summary = commit.message.splitlines()[0] if commit.message else ""
+    return f"{commit_hash[:7]} {summary}"
+
+
+def format_commit_details(commit_hash: str, commit: CommitData) -> str:
+    """Return the detailed presentation of a commit without reading repository state."""
+    lines = [f"commit {commit_hash}"]
+    if commit.parents:
+        lines.append(f"Parents: {' '.join(commit.parents)}")
+    lines.extend(
+        [
+            f"Author: {commit.author}",
+            f"Date:   {datetime.fromtimestamp(commit.author_timestamp, UTC).isoformat()}",
+            "",
+        ]
+    )
+    lines.extend(f"    {line}" for line in commit.message.split("\n"))
+    return "\n".join(lines)
 
 
 class CommitManager:
@@ -181,8 +245,15 @@ class CommitManager:
         ref_path = self._ref_path(name)
         if not os.path.exists(ref_path):
             return None
-        with open(ref_path) as f:
-            return f.read().strip()
+        try:
+            with open(ref_path, encoding="utf-8") as f:
+                commit_hash = f.read().strip()
+        except (OSError, UnicodeDecodeError) as error:
+            raise MiniGitError(f"cannot read ref '{name}'") from error
+        if len(commit_hash) != 40 or any(c not in "0123456789abcdef" for c in commit_hash):
+            display = commit_hash or "<empty>"
+            raise MiniGitError(f"invalid ref '{name}': {display}")
+        return commit_hash
 
     @staticmethod
     def validate_branch_name(name: str) -> None:
@@ -308,7 +379,7 @@ class CommitManager:
         if self._read_pending_merge() is not None:
             raise MiniGitError("merge in progress")
         if not os.path.exists(self._ref_path(name)):
-            raise RefNotFoundError(name)
+            raise RefNotFoundError(f"branch not found: {name}")
         self._require_no_staged_changes()
         commit = self.read_commit(self.read_ref(name))
         self.tree.checkout(commit.tree)
@@ -334,27 +405,36 @@ class CommitManager:
                 i += 1
             if not lines[i].startswith("author "):
                 raise ValueError("missing author line")
-            author = lines[i][len("author ") :].rsplit(" ", 1)[0]
+            author, author_timestamp_text = lines[i][len("author ") :].rsplit(" ", 1)
             i += 1
 
             if not lines[i].startswith("committer "):
                 raise ValueError("missing committer line")
-            committer = lines[i][len("committer ") :].rsplit(" ", 1)[0]
+            committer, committer_timestamp_text = lines[i][len("committer ") :].rsplit(" ", 1)
             if i != len(lines) - 1:
                 raise ValueError("unexpected commit headers")
             for object_hash in [tree, *parents]:
                 if len(object_hash) != 40 or any(c not in "0123456789abcdef" for c in object_hash):
                     raise ValueError("invalid object hash")
-            for identity_line in lines[-2:]:
-                identity, timestamp = identity_line.split(" ", 1)[1].rsplit(" ", 1)
-                if not identity.strip():
-                    raise ValueError("missing identity")
-                int(timestamp)
+            if not author.strip() or not committer.strip():
+                raise ValueError("missing identity")
+            author_timestamp = int(author_timestamp_text)
+            committer_timestamp = int(committer_timestamp_text)
+            datetime.fromtimestamp(author_timestamp, UTC)
+            datetime.fromtimestamp(committer_timestamp, UTC)
 
-        except (UnicodeDecodeError, IndexError, ValueError) as error:
+        except (OSError, OverflowError, UnicodeDecodeError, IndexError, ValueError) as error:
             raise ObjectCorruptError(commit_hash) from error
 
-        return CommitData(tree, parents, author, committer, message)
+        return CommitData(
+            tree,
+            parents,
+            author,
+            committer,
+            message,
+            author_timestamp,
+            committer_timestamp,
+        )
 
     def get_head_tree(self) -> str | None:
         head = self._current_branch()
@@ -368,6 +448,16 @@ class CommitManager:
         return self.read_commit(commit_hash).tree
 
     def walk_history(self, start_hash: str) -> list[str]:
+        """Return reachable hashes in pre-order, following stored parent order."""
+        return [commit_hash for commit_hash, _ in self._walk_history_data(start_hash)]
+
+    def _walk_history_data(self, start_hash: str) -> list[tuple[str, CommitData]]:
+        """Return each reachable commit and its parsed data exactly once.
+
+        Ordering is deterministic pre-order depth-first traversal: a commit is
+        emitted before its parents, and parents are visited in their stored
+        order. Timestamps do not participate in traversal.
+        """
         visited = []
         seen = set()
         stack = [start_hash]
@@ -377,10 +467,9 @@ class CommitManager:
             if commit_hash in seen:
                 continue
             seen.add(commit_hash)
-            visited.append(commit_hash)
-
-            parents = self.read_commit(commit_hash).parents
-            stack.extend(reversed(parents))
+            commit = self.read_commit(commit_hash)
+            visited.append((commit_hash, commit))
+            stack.extend(reversed(commit.parents))
 
         return visited
 
@@ -409,7 +498,7 @@ class CommitManager:
     def create_branch(self, name, commit_hash) -> None:
         """Create a new branch that points at commit_hash"""
         if os.path.exists(self._ref_path(name)):
-            raise RefExistsError(name)
+            raise RefExistsError(f"branch already exists: {name}")
         self.write_ref(name, commit_hash)
 
     def list_branches(self) -> list[str]:
@@ -436,10 +525,19 @@ class CommitManager:
         Fast-forward and no-op cases return None. A clean three-way merge returns
         the new commit hash. A text conflict raises MergeConflictError.
         """
+        result = self.merge_with_result(branch_name)
+        return result.commit_hash if result.outcome == "merged" else None
+
+    def merge_with_result(self, branch_name: str) -> MergeResult:
+        """Merge a branch and describe whether it was current, advanced, or merged.
+
+        This additive helper leaves merge()'s established return contract intact.
+        Text conflicts still raise MergeConflictError with its paths preserved.
+        """
         if self._read_pending_merge() is not None:
             raise MiniGitError("merge in progress")
         if not os.path.exists(self._ref_path(branch_name)):
-            raise RefNotFoundError(branch_name)
+            raise RefNotFoundError(f"branch not found: {branch_name}")
 
         target = self.read_ref(branch_name)
         current = self._current_branch()
@@ -448,14 +546,15 @@ class CommitManager:
         if current_hash is not None and (
             target == current_hash or self.is_ancestor(target, current_hash)
         ):
-            return None
+            return MergeResult("up-to-date")
         if current_hash is None or self.is_ancestor(current_hash, target):
             self._require_no_staged_changes()
             self.tree.checkout(self.read_commit(target).tree)
             self.write_ref(current, target)
-            return None
+            return MergeResult("fast-forward", target)
 
-        return self._three_way_merge(current_hash, target, branch_name)
+        commit_hash = self._three_way_merge(current_hash, target, branch_name)
+        return MergeResult("merged", commit_hash)
 
     def integrate_fetched_tip(self, branch_name: str, commit_hash: str) -> str | None:
         """Integrate one fetched commit into a named local branch.
@@ -742,28 +841,30 @@ class CommitManager:
             unresolved,
         )
 
+    def get_merge_status(self) -> MergeStatus | None:
+        """Return an immutable snapshot of pending merge state for read-only callers."""
+        pending = self._read_pending_merge()
+        if pending is None:
+            return None
+        ours, theirs, message, unresolved = pending
+        return MergeStatus(ours, theirs, message, tuple(unresolved))
+
     def _clear_pending_merge(self) -> None:
         """Delete pending-merge files after a completed merge commit."""
         for path in self._merge_state_paths().values():
             if os.path.exists(path):
                 os.remove(path)
 
-    def log(self) -> list[str]:
-        """Return one summary line per commit reachable from HEAD, newest first"""
+    def log(self, oneline: bool = False) -> list[str]:
+        """Return formatted commits reachable from HEAD in deterministic graph order."""
         commit_hash = self.read_ref(self._current_branch())
         if not commit_hash:
             return []
 
-        lines = []
-        for i in self.walk_history(commit_hash):
-            msg = self.read_commit(i).message
-            if msg:
-                summary = msg.splitlines()[0]
-            else:
-                summary = ""
-            lines.append(f"{i[:7]} {summary}")
-
-        return lines
+        formatter = format_commit_summary if oneline else format_commit_details
+        return [
+            formatter(obj_hash, commit) for obj_hash, commit in self._walk_history_data(commit_hash)
+        ]
 
 
 @dataclass

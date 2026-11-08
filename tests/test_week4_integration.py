@@ -31,7 +31,7 @@ def test_week4_cli_checkpoint_and_push(tmp_path, monkeypatch, capsys):
     assert manager.read_ref("main") == manager.read_ref("feature") == b
     capsys.readouterr()
     assert main(["status"]) == 0
-    assert capsys.readouterr().out.strip() == "clean"
+    assert capsys.readouterr().out.strip() == "On branch main\nclean"
 
     remote = tmp_path / "remote"
     remote.mkdir()

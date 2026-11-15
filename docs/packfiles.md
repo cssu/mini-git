@@ -45,6 +45,14 @@ its type, zlib end-of-stream, uncompressed length, and hash. Duplicate writes an
 `has_object` use the same validation and work for packed-only objects. An invalid
 published index raises `ObjectCorruptError`; it is not silently ignored.
 
+Published index metadata is cached per `ObjectStore` instance after the complete
+index and pack pass validation. The cache is bounded to 64 entries and evicts the
+least recently used entry, so repositories with many packs do not grow the
+reader's memory without limit. Each lookup still enumerates published indexes and
+checks index and pack metadata; new packs are therefore discovered, and changed
+or replaced backing files force validation again. Selected records are decoded
+and hash-checked on every read.
+
 ## Publication and compatibility
 
 Both temporary files are closed and validated before publication. The pack is

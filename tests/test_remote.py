@@ -1576,7 +1576,12 @@ def test_bad_ref_session_does_not_stop_server(push_pair, ref_request):
     tip = _commit(pair.remote_store, pair.remote_commits, {}, [])
     pair.remote_commits.create_branch("feature/topic", tip)
     refs = Path(pair.server.repo_path) / ".minigit/refs/heads"
-    (refs / "escape").symlink_to(refs / "feature", target_is_directory=True)
+    try:
+        (refs / "escape").symlink_to(refs / "feature", target_is_directory=True)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("directory symlinks require Windows developer mode or privilege")
+        raise
     with socket.create_connection(("127.0.0.1", pair.server.port), timeout=2) as sock:
         buf = bytearray()
         send_line(sock, "AUTH tok")

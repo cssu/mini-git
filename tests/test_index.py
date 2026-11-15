@@ -636,6 +636,9 @@ def test_unicode_text_is_diffed_as_text(repo):
     assert result.line_diffs["u.txt"] == [LineEdit(1, 1, ["naïve!\n"])]
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows does not preserve POSIX executable bits"
+)
 def test_mode_only_change_is_modified_with_no_line_edits(repo):
     write(repo, "run.sh", "echo hi\n", mode=0o644)
     tree = snapshot_tree(repo, ["run.sh"])
@@ -807,6 +810,9 @@ def test_cli_binary_file_reports_binary_changed(cli_repo, capsys):
     assert "@@" not in out
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows does not preserve POSIX executable bits"
+)
 def test_cli_mode_only_change(cli_repo, capsys):
     repo, commit = cli_repo
     write(repo, "run.sh", "echo hi\n", mode=0o644)
@@ -1035,6 +1041,9 @@ def local(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows does not preserve POSIX executable bits"
+)
 def test_fast_forward_into_fresh_repo_restores_everything(source, local, monkeypatch, capsys):
     download(source, local)
 
@@ -1054,6 +1063,9 @@ def test_fast_forward_into_fresh_repo_restores_everything(source, local, monkeyp
     assert diff_text(local, monkeypatch, capsys) == ""
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows does not preserve POSIX executable bits"
+)
 def test_second_fast_forward_applies_edit_delete_new_dir_and_mode(
     source, local, monkeypatch, capsys
 ):
@@ -1433,6 +1445,9 @@ def test_cli_binary_files_added_and_deleted_get_a_summary(cli_repo, capsys):
     assert not any(line.startswith("@@") for line in out)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows rejects newline characters in filenames"
+)
 def test_cli_diff_shows_space_unicode_and_odd_paths_clearly(cli_repo, capsys):
     repo, commit = cli_repo
     write(repo, "my dir/café notes.txt", "one\n")
@@ -1496,6 +1511,9 @@ def test_status_and_diff_leave_a_conflicted_repo_unchanged(merging, monkeypatch,
     assert local.object_files() == objects
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows rejects newline characters in filenames"
+)
 def test_expected_failures_name_the_path_and_the_next_step(repo):
     with pytest.raises(MiniGitError, match=r"No such file: nope\.txt; check the path"):
         repo.stage_file("nope.txt")

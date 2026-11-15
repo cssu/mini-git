@@ -15,6 +15,7 @@ import struct
 import tempfile
 import uuid
 import zlib
+from collections import OrderedDict
 from collections.abc import Iterable
 from pathlib import Path
 from typing import NamedTuple
@@ -30,6 +31,7 @@ class TreeEntry(NamedTuple):
 
 
 class ObjectStore:
+    _MAX_INDEX_CACHE_ENTRIES = 64
     _OBJECT_TYPES = {"blob", "tree", "commit"}
     _PACK_MAGIC = b"MGPK"
     _INDEX_MAGIC = b"MGIX"
@@ -49,14 +51,14 @@ class ObjectStore:
         self.root = Path(repo_path)
         self.objects_dir = self.root / ".minigit" / "objects"
         self.pack_dir = self.objects_dir / "pack"
-        self._index_cache: dict[
+        self._index_cache: OrderedDict[
             Path,
             tuple[
-                tuple[int, int, int, int],
+                tuple[int, int, int, int, int, int],
                 dict[str, tuple[int, int]],
                 Path,
             ],
-        ] = {}
+        ] = OrderedDict()
 
     def hash_object(self, data: bytes, obj_type: str) -> str:
         """
@@ -243,6 +245,9 @@ class ObjectStore:
     def _read_cached_index(self, index_path: Path) -> tuple[dict[str, tuple[int, int]], Path]:
         """
         Reads a cached index from the file system.
+        If the index is already cached and has not changed,
+        return the cached entries and pack path.
+        Otherwise, read the index from disk, validate it, and cache it for future use.
         """
         pack_path = index_path.with_suffix(".pack")
         try:
@@ -254,15 +259,21 @@ class ObjectStore:
         signature = (
             index_stat.st_mtime_ns,
             index_stat.st_size,
+            index_stat.st_ino,
             pack_stat.st_mtime_ns,
             pack_stat.st_size,
+            pack_stat.st_ino,
         )
         cached = self._index_cache.get(index_path)
         if cached is not None and cached[0] == signature:
+            self._index_cache.move_to_end(index_path)
             return cached[1], cached[2]
 
         entries, pack_path = self._read_index(index_path, pack_path)
         self._index_cache[index_path] = (signature, entries, pack_path)
+        self._index_cache.move_to_end(index_path)
+        while len(self._index_cache) > self._MAX_INDEX_CACHE_ENTRIES:
+            self._index_cache.popitem(last=False)
         return entries, pack_path
 
     def _read_index(

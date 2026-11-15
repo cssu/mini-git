@@ -560,6 +560,21 @@ def test_packed_index_cache_rechecks_changed_pack(tmp_path: Path) -> None:
         store.read_object(obj_hash)
 
 
+def test_packed_index_cache_is_bounded(tmp_path: Path) -> None:
+    """Evict old pack metadata while keeping every published pack readable."""
+    store = ObjectStore(tmp_path)
+    hashes = []
+    for index in range(store._MAX_INDEX_CACHE_ENTRIES + 1):
+        obj_hash = store.write_object(f"object-{index}".encode(), "blob")
+        store.pack_objects([obj_hash])
+        store._object_path(obj_hash).unlink()
+        hashes.append(obj_hash)
+        assert store.read_object(obj_hash) == ("blob", f"object-{index}".encode())
+
+    assert len(store._index_cache) == store._MAX_INDEX_CACHE_ENTRIES
+    assert store.read_object(hashes[0]) == ("blob", b"object-0")
+
+
 def test_duplicate_write_validates_packed_only_object(tmp_path: Path) -> None:
     store = ObjectStore(tmp_path)
     obj_hash = store.write_object(b"packed", "blob")

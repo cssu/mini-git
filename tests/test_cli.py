@@ -1,16 +1,24 @@
+import os
 import subprocess
 import sys
+from pathlib import Path
 
 from minigit.commits import CommitManager
 
 
 def run_cli(repo, *args):
+    environment = os.environ.copy()
+    repository_root = str(Path(__file__).resolve().parents[1])
+    environment["PYTHONPATH"] = os.pathsep.join(
+        path for path in (repository_root, environment.get("PYTHONPATH", "")) if path
+    )
     return subprocess.run(
         [sys.executable, "-m", "minigit.cli", *args],
         cwd=repo,
         text=True,
         capture_output=True,
         check=False,
+        env=environment,
     )
 
 

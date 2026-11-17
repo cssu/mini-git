@@ -69,3 +69,28 @@ most of its time is the Myers diff, which was not changed.
 ## Re-run
 
 Run these numbers again with the shared benchmark (#47) once it is merged.
+
+## Object-storage measurements
+
+The Week 8 shared fixture uses 512 deterministic blobs with 2,048-byte
+payloads. On Python 3.11.9 and Windows 10 build 26200, the cached run recorded:
+
+| Measurement | Result |
+| --- | ---: |
+| Loose object write time | 1,972.382 ms |
+| Loose stored bytes | 27,534 |
+| Loose fresh-store read time | 7,278.564 ms |
+| Pack time | 128.798 ms |
+| Retained loose bytes after packing | 27,534 |
+| Pack bytes | 33,179 |
+| Index bytes | 18,444 |
+| Packed-only retained loose bytes | 0 |
+| Packed-only fresh-store read time | 190.982 ms |
+
+The controlled `--no-cache` comparison took 5,017.308 ms for the packed-only
+fresh-store read. Three repeated packed reads took 28.802 seconds without the
+metadata cache and 0.688 seconds with it. These results are fixture-specific
+measurements, not performance guarantees. The cache avoids repeated complete
+pack validation but does not cache object payloads; loose-file latency,
+filesystem discovery, retained loose originals, pruning, and delta compression
+remain separate concerns.

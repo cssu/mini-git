@@ -5,6 +5,10 @@ through `read_object`, and returns `(pack_path, index_path)`. Loose originals
 remain in place; new objects are written loose. Pruning and delta compression
 are not implemented.
 
+Packfiles are currently a Python API, not a CLI command. The supported entry
+point is `ObjectStore.pack_objects`; `hash-object` and `cat-file` continue to
+operate on individual objects.
+
 ```python
 from minigit.objects import ObjectStore
 
@@ -45,6 +49,14 @@ its type, zlib end-of-stream, uncompressed length, and hash. Duplicate writes an
 `has_object` use the same validation and work for packed-only objects. An invalid
 published index raises `ObjectCorruptError`; it is not silently ignored.
 
+After validation, an `ObjectStore` instance caches the parsed index together
+with the index and pack modification times and sizes. Every lookup still
+enumerates the current `pack-*.idx` files, so an existing store discovers a
+newly published pack. A changed published file invalidates its cached metadata
+and repeats full validation; the selected record is then decoded and hash
+checked on every read. The cache stores metadata, not object payloads, and is
+discarded when the store instance is discarded.
+
 ## Publication and compatibility
 
 Both temporary files are closed and validated before publication. The pack is
@@ -56,3 +68,9 @@ an orphaned pack without an index is ignored. Loose originals remain readable.
 History, checkout, diff, merge, and networking use the same object API for loose,
 packed, and mixed storage. Packfiles are a local storage format: push continues
 to transfer validated individual objects through the existing protocol.
+
+## Readiness limitations
+
+The current format retains loose originals after packing, has no pruning or
+garbage collection, and does not use delta compression. The index and pack
+formats are version 1 and are intentionally unchanged by the storage demo.

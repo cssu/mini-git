@@ -5,6 +5,10 @@ through `read_object`, and returns `(pack_path, index_path)`. Loose originals
 remain in place; new objects are written loose. Pruning and delta compression
 are not implemented.
 
+Packfiles are currently a Python API, not a CLI command. The supported entry
+point is `ObjectStore.pack_objects`; `hash-object` and `cat-file` continue to
+operate on individual objects.
+
 ```python
 from minigit.objects import ObjectStore
 
@@ -71,3 +75,10 @@ an orphaned pack without an index is ignored. Loose originals remain readable.
 History, checkout, diff, merge, and networking use the same object API for loose,
 packed, and mixed storage. Packfiles are a local storage format: push continues
 to transfer validated individual objects through the existing protocol.
+
+## Readiness limitations
+
+The current format retains loose originals after packing, has no pruning or
+garbage collection, and does not use delta compression. The index and pack
+formats remain version 1. The [storage demo](demo.md) uses a disposable
+repository to demonstrate loose, mixed, and packed-only snapshots.

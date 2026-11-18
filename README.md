@@ -185,6 +185,10 @@ minigit pull 127.0.0.1:9418 main --token demo-token        # fetch, then integra
 
 ## Docs
 
+- [Storage demo](docs/demo.md) - a runnable loose, mixed, and packed snapshot
+  rehearsal; the full project demo remains in progress.
+- [Module 1 writeup](docs/writeups/module-1.md) - object formats, validation,
+  packfiles, measured tradeoffs, and remaining limitations.
 - [Onboarding guide](https://docs.google.com/document/d/1D77Ncmtunxj7GVADytHo1An6BKzaV-Ep7AxAYfL405k/edit?tab=t.0) -
   start here if you are new: setup, branching, workflow, pull requests, code
   review, and coding standards.

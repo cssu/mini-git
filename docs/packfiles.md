@@ -46,12 +46,19 @@ its type, zlib end-of-stream, uncompressed length, and hash. Duplicate writes an
 published index raises `ObjectCorruptError`; it is not silently ignored.
 
 Published index metadata is cached per `ObjectStore` instance after the complete
-index and pack pass validation. The cache is bounded to 64 entries and evicts the
-least recently used entry, so repositories with many packs do not grow the
-reader's memory without limit. Each lookup still enumerates published indexes and
-checks index and pack metadata; new packs are therefore discovered, and changed
-or replaced backing files force validation again. Selected records are decoded
-and hash-checked on every read.
+index and pack pass validation. The cache retains at most 64 parsed indexes and
+evicts the least recently used entry; memory per entry still depends on the
+number of objects in that pack. Each lookup enumerates published indexes and
+checks each index and pack's nanosecond modification time, size, and inode.
+New packs are discovered, and a change to any of those metadata fields forces
+full validation again. Selected records are decoded and hash-checked on every
+read, even on a cache hit.
+
+Published pairs are immutable. The metadata cache is not a filesystem integrity
+monitor: external in-place edits that preserve all signature fields can leave
+cached index metadata stale. Use a fresh `ObjectStore` to revalidate the complete
+pack after external changes. Selected-record byte and hash validation still
+applies to every read.
 
 ## Publication and compatibility
 

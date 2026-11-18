@@ -49,13 +49,20 @@ its type, zlib end-of-stream, uncompressed length, and hash. Duplicate writes an
 `has_object` use the same validation and work for packed-only objects. An invalid
 published index raises `ObjectCorruptError`; it is not silently ignored.
 
-After validation, an `ObjectStore` instance caches the parsed index together
-with the index and pack modification times and sizes. Every lookup still
-enumerates the current `pack-*.idx` files, so an existing store discovers a
-newly published pack. A changed published file invalidates its cached metadata
-and repeats full validation; the selected record is then decoded and hash
-checked on every read. The cache stores metadata, not object payloads, and is
-discarded when the store instance is discarded.
+Published index metadata is cached per `ObjectStore` instance after the complete
+index and pack pass validation. The cache retains at most 64 parsed indexes and
+evicts the least recently used entry; memory per entry still depends on the
+number of objects in that pack. Each lookup enumerates published indexes and
+checks each index and pack's nanosecond modification time, size, and inode.
+New packs are discovered, and a change to any of those metadata fields forces
+full validation again. Selected records are decoded and hash-checked on every
+read, even on a cache hit.
+
+Published pairs are immutable. The metadata cache is not a filesystem integrity
+monitor: external in-place edits that preserve all signature fields can leave
+cached index metadata stale. Use a fresh `ObjectStore` to revalidate the complete
+pack after external changes. Selected-record byte and hash validation still
+applies to every read.
 
 ## Publication and compatibility
 
@@ -73,4 +80,5 @@ to transfer validated individual objects through the existing protocol.
 
 The current format retains loose originals after packing, has no pruning or
 garbage collection, and does not use delta compression. The index and pack
-formats are version 1 and are intentionally unchanged by the storage demo.
+formats remain version 1. The [storage demo](demo.md) uses a disposable
+repository to demonstrate loose, mixed, and packed-only snapshots.

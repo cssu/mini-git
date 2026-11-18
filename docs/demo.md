@@ -1,99 +1,93 @@
 # Storage demo
 
-This is the Module 1 segment for the shared Week 9 demo. It uses a disposable
-temporary repository and the existing Python object API. There is no `pack`
-CLI command; packing is demonstrated with `ObjectStore.pack_objects`.
+This is the Module 1 segment for the shared demo. The complete local/network
+runbook and teammate rehearsal remain tracked in #63/#70; the project-source
+trial is #73. This segment uses a disposable repository and the existing Python
+object API. There is no `pack` CLI command.
 
-## Presenter flow
+## Run the storage segment
 
-Run this from the repository root with the project environment selected:
+From the repository root after installing the project environment:
 
-```python
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
-from minigit.commits import CommitManager
-from minigit.objects import ObjectStore, TreeEntry
-
-with TemporaryDirectory(prefix="minigit-storage-demo-") as directory:
-    root = Path(directory)
-    store = ObjectStore(root)
-    commits = CommitManager(root, store=store)
-
-    original = b"hello\n"
-    changed = b"hello, storage\n"
-    original_id = store.hash_object(original, "blob")
-    same_id = store.hash_object(original, "blob")
-    changed_id = store.hash_object(changed, "blob")
-    assert original_id == same_id
-    assert original_id != changed_id
-
-    blob = store.write_object(original, "blob")
-    nested = store.write_tree([TreeEntry("100644", "blob", blob, "hello.txt")])
-    root_tree = store.write_tree([TreeEntry("40000", "tree", nested, "nested")])
-    base = commits.create_commit(root_tree, [], "demo <demo@example.com>", "base")
-    side = commits.create_commit(root_tree, [base], "demo <demo@example.com>", "side")
-    merge = commits.create_commit(root_tree, [base, side], "demo <demo@example.com>", "merge")
-
-    objects = [blob, nested, root_tree, base, side, merge]
-    store.pack_objects(objects)
-    for object_id in objects:
-        store._object_path(object_id).unlink()
-
-    packed_store = ObjectStore(root)
-    assert packed_store.read_object(blob) == ("blob", original)
-    assert packed_store.read_tree(root_tree)[0].type == "tree"
-    assert commits.read_commit(merge).parents == [base, side]
+```bash
+.venv/bin/python scripts/demo_storage.py
 ```
 
-Expected results:
+On Windows, use `.\.venv\Scripts\python.exe scripts\demo_storage.py`.
+
+Expected output:
 
 ```text
 identical bytes -> same object ID: true
 changed bytes -> different object ID: true
-nested tree -> tree object links to blob and subtree: true
-merge commit -> preserves two parents: true
-packed-only snapshot -> all six objects read successfully: true
+nested tree -> links to subtree and blob: true
+merge commit -> preserves both parents: true
+loose snapshot -> all seven objects verified: true
+mixed snapshot -> all seven objects verified: true
+packed-only snapshot -> all seven objects verified: true
+temporary repository cleaned up: true
 ```
 
-## Loose, packed-only, and mixed reads
+[`scripts/demo_storage.py`](../scripts/demo_storage.py) creates a blob, two
+linked trees, a root commit, two children of that root, and a two-parent commit.
+It verifies exact object types/bytes, nested tree links, and parent order using
+a fresh store in each storage state. This illustrates storage and graph links;
+the interactive merge/conflict workflow belongs in M3's shared demo segment.
 
-Use the same object list to show the three supported storage states:
-
-| State | Fixture action | Expected read |
+| State | Fixture action | Check |
 | --- | --- | --- |
-| Loose | Keep all loose object files | Every object returns its original type and bytes |
-| Packed-only | Call `pack_objects`, then remove loose files in the temporary repository | Every object is read through the published index and pack |
-| Mixed | Pack only a subset and keep the remaining loose files | Loose objects are preferred; packed objects are read as fallback |
+| Loose | Keep all seven loose objects | Fresh store verifies every object |
+| Mixed | Pack three objects and remove their loose fixture copies | Fresh store verifies all seven through loose and packed reads |
+| Packed-only | Pack all seven and remove remaining loose fixture copies | Fresh store verifies every object and both parent links |
 
-The removal step is safe here because the repository is created by
-`TemporaryDirectory`. Do not remove loose objects from a working repository as
-part of the demo.
+Loose-file removal happens only inside `TemporaryDirectory`; cleanup also runs
+if an assertion fails. Do not remove loose objects from a working repository
+to rehearse this demo. Rerunning the script creates a new isolated fixture.
 
-The larger shared fixture is reproducible with:
+## Performance segment
 
-```powershell
-.\.venv\Scripts\python.exe scripts\benchmark_packfiles.py --profile
+The separate storage benchmark is reproducible with:
+
+```bash
+.venv/bin/python scripts/benchmark_packfiles.py --profile
+.venv/bin/python scripts/benchmark_packfiles.py --no-cache --profile
 ```
 
-It reports loose bytes, retained loose bytes, pack bytes, index bytes, pack
-time, and packed-only read time. `--no-cache --profile` is the controlled
-comparison for repeated index and pack validation.
+Use the same Windows interpreter substitution as above. Commands, exact
+production revision, environment, byte totals, and fresh/repeated-run
+definitions are in [the performance report](performance.md#reproduction-of-71).
+The default fixture contains 512 blobs, each with a 22-byte prefix plus 2,048
+generated bytes. It does not replace #47/#58's shared project/network benchmark.
+
+`--no-cache` is a controlled comparison on the current code. It preserves full
+pack/index validation and disables metadata reuse; it is not an exact checkout
+of an older implementation. The output reports retained loose bytes separately
+from pack and index bytes.
 
 ## Failure guarantees to explain
 
-- A missing hash or absent object raises `ObjectNotFoundError`.
-- Malformed loose or packed bytes raise `ObjectCorruptError`.
-- A corrupt loose copy wins over a valid packed copy; it is never silently
-  replaced by fallback lookup.
+- Missing hashes raise `ObjectNotFoundError`; malformed stored objects raise
+  `ObjectCorruptError`.
+- A corrupt loose copy is never hidden by fallback to a valid packed copy.
 - Duplicate writes validate the existing object before returning its hash.
 - Pack publication validates both temporary files, renames the pack first, and
-  publishes the index last. A failed publication leaves earlier readable
-  objects intact and does not expose an unpublished index.
+  publishes the index last. Earlier objects remain readable after a failed
+  publication; readers ignore an orphan pack without a published index.
+- The 64-entry metadata cache assumes immutable published files and invalidates
+  on size, nanosecond modification-time, or inode changes. Selected records are
+  decoded and hash-checked on every read. See [cache assumptions](packfiles.md#lookup-and-validation).
 
-## Rehearsal record
+## Validation record and remaining rehearsal
 
-The flow above was rehearsed successfully on revision
-`006740a34dc70c70b47397b25a9b681ecdf3f463` with Python 3.11.9 on Windows.
-The object regression suite passed 79 tests. The demo intentionally does not
-claim pruning, garbage collection, delta compression, or a pack CLI.
+The original storage flow was reported as rehearsed on `006740a` with Python
+3.11.9/Windows and 79 object tests. The executable flow above was validated on
+2026-11-18 with the #72 integration changes based on `edee155`, Python
+3.13.5/macOS 26.6.2. Its exact stdout matches the block above, and the combined
+quality check passes all 445 tests, including 82 object tests. The final #72
+commit identifies the complete script and documentation revision.
+
+Another teammate must still follow this segment at the final shared-checkpoint
+revision and record their name, revision, environment, and any blockers in
+#60/#67. This local validation does not claim that teammate rehearsal or the
+full project demo is complete. Pruning, garbage collection, delta compression,
+and a pack CLI remain outside this segment.

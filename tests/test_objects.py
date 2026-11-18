@@ -560,6 +560,47 @@ def test_packed_index_cache_rechecks_changed_pack(tmp_path: Path) -> None:
         store.read_object(obj_hash)
 
 
+@pytest.mark.parametrize("suffix", [".pack", ".idx"])
+def test_packed_index_cache_rechecks_replaced_file_with_preserved_metadata(
+    tmp_path: Path, suffix: str
+) -> None:
+    """Atomic replacement must invalidate cached validation even with old size/mtime."""
+    store = ObjectStore(tmp_path)
+    obj_hash = store.write_object(b"content", "blob")
+    pack_path, index_path = store.pack_objects([obj_hash])
+    store._object_path(obj_hash).unlink()
+    assert store.read_object(obj_hash) == ("blob", b"content")
+
+    target = pack_path if suffix == ".pack" else index_path
+    original_stat = target.stat()
+    corrupted = bytearray(target.read_bytes())
+    corrupted[0] ^= 0xFF  # Header corruption leaves the selected record intact.
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(corrupted)
+    os.utime(replacement, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    os.replace(replacement, target)
+    assert target.stat().st_size == original_stat.st_size
+    assert target.stat().st_mtime_ns == original_stat.st_mtime_ns
+
+    with pytest.raises(ObjectCorruptError):
+        store.read_object(obj_hash)
+
+
+def test_packed_index_cache_is_bounded(tmp_path: Path) -> None:
+    """Evict old pack metadata while keeping every published pack readable."""
+    store = ObjectStore(tmp_path)
+    hashes = []
+    for index in range(store._MAX_INDEX_CACHE_ENTRIES + 1):
+        obj_hash = store.write_object(f"object-{index}".encode(), "blob")
+        store.pack_objects([obj_hash])
+        store._object_path(obj_hash).unlink()
+        hashes.append(obj_hash)
+        assert store.read_object(obj_hash) == ("blob", f"object-{index}".encode())
+
+    assert len(store._index_cache) == store._MAX_INDEX_CACHE_ENTRIES
+    assert store.read_object(hashes[0]) == ("blob", b"object-0")
+
+
 def test_duplicate_write_validates_packed_only_object(tmp_path: Path) -> None:
     store = ObjectStore(tmp_path)
     obj_hash = store.write_object(b"packed", "blob")

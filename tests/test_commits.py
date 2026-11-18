@@ -1368,7 +1368,12 @@ def test_ref_paths_reject_symlinks_and_file_directory_collisions(tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "topic").write_text("untouched")
-    (tmp_path / ".minigit/refs/heads/escape").symlink_to(outside, target_is_directory=True)
+    try:
+        (tmp_path / ".minigit/refs/heads/escape").symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("directory symlinks require Windows developer mode or privilege")
+        raise
     for name in ["escape/topic", "main/topic"]:
         with pytest.raises(MiniGitError):
             manager.write_ref(name, tip)

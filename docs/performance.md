@@ -70,6 +70,25 @@ most of its time is the Myers diff, which was not changed.
 
 Run these numbers again with the shared benchmark (#47) once it is merged.
 
+## Reproduction
+
+The benchmark is checked in as `scripts/benchmark_working_tree.py`. It builds a throwaway repository with 3000 small files (40 lines each, in 50 folders) and one 20000-line file, commits them, and times one call of `cmd_status` and `cmd_diff` in each situation. From the repository root:
+
+    PYTHONPATH=. python3 scripts/benchmark_working_tree.py
+    PYTHONPATH=. python3 scripts/benchmark_working_tree.py --profile
+
+Run on 2026-11-19 on `main` at `2e87586` plus the W10 branch changes (this script and the switch to `get_merge_status()`, which do not touch the file walk), Python 3.13.5, MacBook Air (Apple silicon). One run, no other heavy programs open:
+
+| Situation | status | diff |
+| --- | --- | --- |
+| nothing changed | 0.072 s | 0.070 s |
+| 1 small file changed | 0.071 s | 0.070 s |
+| 50 small files changed | 0.071 s | 0.072 s |
+| + big file, 2 edits | 0.071 s | 0.078 s |
+| + big file, 500 scattered edits | 0.071 s | 0.177 s |
+
+These agree with the After table above to within about 0.01 s, which is ordinary run-to-run variation. This is a Module 2 fixture, not the shared project benchmark in #47, which is not merged yet. Need to rerun with that still. 
+
 # Object-storage performance
 
 ## How it was measured

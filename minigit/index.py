@@ -535,11 +535,11 @@ def cmd_add(args) -> int:
     full_path = os.path.join(wt.root, args.path)
     rel_path = os.path.relpath(full_path, wt.root).replace(os.sep, "/")
     wt._validate_checkout_path(rel_path)
-    pending = manager._read_pending_merge()
+    merge = manager.get_merge_status()
     # A delete/modify conflict can have no pre-merge index entry. Explicitly
     # adding its absent path still resolves the conflict as a deletion.
     missing_conflict = (
-        pending is not None and rel_path in pending[3] and not os.path.lexists(full_path)
+        merge is not None and rel_path in merge.unresolved_paths and not os.path.lexists(full_path)
     )
     if missing_conflict:
         wt.write_index([entry for entry in wt.read_index() if entry.path != rel_path])
@@ -602,8 +602,8 @@ def _head_header(head) -> str:
 
 def _unresolved_merge_paths(manager) -> list[str]:
     """Paths of a pending merge that `add` has not resolved yet (M3 owns the merge state)."""
-    pending = manager._read_pending_merge()
-    return sorted(pending[3]) if pending else []
+    merge = manager.get_merge_status()
+    return sorted(merge.unresolved_paths) if merge else []
 
 
 def cmd_status(args) -> int:

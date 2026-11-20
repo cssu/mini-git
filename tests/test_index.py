@@ -692,7 +692,7 @@ def cli_repo(tmp_path, monkeypatch):
         def read_head(self):
             return None
 
-        def _read_pending_merge(self):
+        def get_merge_status(self):
             return None
 
     fake = types.ModuleType("minigit.commits")
@@ -1363,8 +1363,8 @@ def test_status_lists_unresolved_merge_paths_from_the_manager(cli_repo, capsys, 
     write(repo, "a.txt", "x\n")
     monkeypatch.setattr(
         sys.modules["minigit.commits"].CommitManager,
-        "_read_pending_merge",
-        lambda self: ("ours", "theirs", "merge", ["a.txt"]),
+        "get_merge_status",
+        lambda self: types.SimpleNamespace(unresolved_paths=("a.txt",)),
     )
 
     # one heading, no duplicates: a.txt is not also "untracked" or "not staged"

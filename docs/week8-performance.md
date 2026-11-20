@@ -85,6 +85,17 @@ publication tests cover invalid indexes and records, truncation and zlib
 failures, wrong hashes, and failed publication. These tests assert behavior,
 not wall-clock thresholds.
 
+## Final checkpoint reconciliation
+
+The final integrated Windows run at revision
+`2e875865a312479abecb475a77fddee73fcd5667` measured 270.926 ms for a cached
+packed-only fresh read and 4,793.757 ms with `--no-cache`; the corresponding
+three-pass profile took 0.874 s and 23.205 s. The 512-object fixture and
+Python/Windows environment are recorded in
+[the shared performance report](performance.md#final-week-10-windows-checkpoint).
+These values replace neither historical Mac nor Windows observations; they
+are the exact-revision evidence for the storage segment.
+
 ## Remaining findings and scope
 
 - Loose reads remain sensitive to Windows filesystem latency; this change does

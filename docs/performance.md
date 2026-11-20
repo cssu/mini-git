@@ -157,3 +157,39 @@ larger than the 27,534-byte loose-only representation. Packing retains loose
 originals until the benchmark deliberately removes them in its disposable
 fixture. Neither these measurements nor the older Windows runs complete the
 shared project benchmark in #47/#58.
+
+## Final Week 10 Windows checkpoint
+
+Re-run on 2026-11-19 at final integrated storage revision
+`2e875865a312479abecb475a77fddee73fcd5667`, after checking out
+`docs/week10-storage-handoff`, with Python 3.11.9 and
+Windows 10 build 26200 on the local development machine. The commands were:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\benchmark_packfiles.py --profile
+.\.venv\Scripts\python.exe scripts\benchmark_packfiles.py --no-cache --profile
+```
+
+Both runs use a fresh temporary repository, 512 objects, a 22-byte unique
+prefix, and a 2,048-byte repeated payload per blob. The measured fresh read
+uses a new `ObjectStore` instance for one pass; the profile uses another new
+store and three passes. These are one-run observations, not CI thresholds.
+
+| Measurement | Cached | `--no-cache` |
+| --- | ---: | ---: |
+| Loose object write time | 627.685 ms | 630.954 ms |
+| Loose stored bytes | 27,534 | 27,534 |
+| Loose fresh-store read time | 5,558.751 ms | 4,723.956 ms |
+| Pack time | 148.529 ms | 151.519 ms |
+| Retained loose bytes after packing | 27,534 | 27,534 |
+| Pack bytes | 33,179 | 33,179 |
+| Index bytes | 18,444 | 18,444 |
+| Packed-only fresh-store read time | 270.926 ms | 4,793.757 ms |
+| Three repeated packed reads, profiled | 0.874 s | 23.205 s |
+
+At this revision, `--no-cache` bypasses the 64-entry parsed-index metadata
+cache on the current code while preserving complete index and pack validation.
+It is not an exact historical reproduction. The one-pack fixture does not
+isolate the cache bound or inode signature; it is still the reproducible M1
+storage measurement, separate from #47/#58's shared project and network
+checkpoint.

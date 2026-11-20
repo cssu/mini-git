@@ -110,6 +110,13 @@ removes them. `--no-cache` disables reuse on the same code, not an exact
 historical checkout. Earlier Windows measurements remain separately labeled
 in the performance documents.
 
+The exact final Windows checkpoint at
+`2e875865a312479abecb475a77fddee73fcd5667` used Python 3.11.9 on Windows 10
+build 26200. It measured 270.926 ms for one cached packed-only fresh read and
+4,793.757 ms for `--no-cache`; three profiled passes took 0.874 s cached and
+23.205 s uncached. These are the storage-only handoff measurements, not a
+shared-project or network result.
+
 This storage-only fixture does not complete the shared project/network
 benchmark in #47/#58. The one-pack measurement also does not isolate the
 effect of the 64-entry bound or inode checks added in #71.

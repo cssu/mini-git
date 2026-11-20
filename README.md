@@ -88,9 +88,7 @@ resolve each path, run `minigit add <path>`, then run
 
 `minigit diff` shows line changes between HEAD and working files, including
 untracked files, binary changes, executable modes, and missing final newlines.
-`minigit status` retains its staged / not staged / untracked sections. Both
-commands are read-only. Object storage also supports local
-[packfiles](docs/packfiles.md) without changing object hashes.
+`minigit status` starts with the current branch, then lists staged (HEAD vs index), not staged (index vs working files), and untracked paths, plus an unresolved (merge conflict) section while a merge is pending. It compares content, never timestamps. Object storage also supports local [packfiles](docs/packfiles.md) without changing object hashes.
 
 To test push, initialize another scratch repository and run
 `minigit serve --port 9418 --token demo-token` there. From the first repository,
@@ -189,6 +187,10 @@ minigit pull 127.0.0.1:9418 main --token demo-token        # fetch, then integra
   rehearsal; the full project demo remains in progress.
 - [Module 1 writeup](docs/writeups/module-1.md) - object formats, validation,
   packfiles, measured tradeoffs, and remaining limitations.
+- [Working-tree demo](docs/demo.md) - status, diff, safe branch switching, and
+  conflict resolution rehearsal.
+- [Module 2 writeup](docs/writeups/module-2.md) - index snapshots, nested trees,
+  the status model, Myers diff, checkout safety, and measured results.
 - [Onboarding guide](https://docs.google.com/document/d/1D77Ncmtunxj7GVADytHo1An6BKzaV-Ep7AxAYfL405k/edit?tab=t.0) -
   start here if you are new: setup, branching, workflow, pull requests, code
   review, and coding standards.

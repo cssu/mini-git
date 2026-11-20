@@ -91,3 +91,227 @@ revision and record their name, revision, environment, and any blockers in
 #60/#67. This local validation does not claim that teammate rehearsal or the
 full project demo is complete. Pruning, garbage collection, delta compression,
 and a pack CLI remain outside this segment.
+
+
+# Working-tree demo
+
+This is the Module 2 segment for the shared demo: staging, status, diff, safe branch switching, and explicit conflict resolution. It uses the real CLI in disposable folders, and every command is a separate process. 
+
+## Run the working-tree segment
+
+From the repository root after installing the project environment:
+
+```
+export PYTHONPATH="$(pwd)"
+alias minigit='python3 -m minigit.cli'
+```
+
+Use `.venv/bin/python -m minigit.cli` in place of `python3 -m minigit.cli` if you run the project's virtual environment. The segment uses a POSIX shell (`printf`, `chmod`, `ls -l`), so on Windows run it in Git Bash.
+
+Start each part below in a new empty folder, for example:
+
+```
+mkdir /tmp/wt-demo-1 && cd /tmp/wt-demo-1
+minigit init
+```
+
+`init` and `add` print nothing when they succeed. Commit and branch hashes differ on every run.
+
+## 1. Three states: committed, staged, edited again
+
+```
+$ printf 'one\n' > notes.txt
+$ minigit add notes.txt
+$ minigit commit -m first
+[main 84bc7e1] first
+$ printf 'two\n' > notes.txt
+$ minigit add notes.txt
+$ printf 'three\n' > notes.txt
+$ minigit status
+On branch main
+staged:
+  notes.txt
+not staged:
+  notes.txt
+$ minigit diff
+diff --minigit a/notes.txt b/notes.txt
+--- a/notes.txt
++++ b/notes.txt
+@@ -1,1 +1,1 @@
+-one
++three
+$ minigit commit -m second
+[main a305708] second
+$ minigit status
+On branch main
+not staged:
+  notes.txt
+$ minigit diff
+diff --minigit a/notes.txt b/notes.txt
+--- a/notes.txt
++++ b/notes.txt
+@@ -1,1 +1,1 @@
+-two
++three
+```
+
+At the first `status`, three versions of `notes.txt` exist:
+
+| Place | Content | Compared with | Result |
+| --- | --- | --- | --- |
+| Last commit (HEAD) | `one` | the index | differs, so `staged:` |
+| Index (staged) | `two` | the file on disk | differs, so `not staged:` |
+| File on disk | `three` | | |
+
+`diff` compares HEAD with the file on disk and does not look at the index, so the first `diff` shows `one` against `three`. The commit records the index, not the disk, so it saves `two`. The last `diff` proves it: HEAD now holds `two` and the disk still holds `three`.
+
+## 2. Safe branch switching
+
+```
+$ printf 'A\n' > a.txt
+$ printf '#!/bin/sh\necho hi\n' > run.sh
+$ chmod +x run.sh
+$ minigit add a.txt
+$ minigit add run.sh
+$ minigit commit -m base
+[main 472cfa2] base
+$ minigit branch feature
+Created branch 'feature' at 472cfa2.
+$ minigit checkout feature
+Switched to branch 'feature'.
+$ printf 'B\n' > a.txt
+$ printf 'x\n' > extra.txt
+$ minigit add a.txt
+$ minigit add extra.txt
+$ minigit commit -m feature-work
+[feature 29faa57] feature-work
+$ minigit checkout main
+Switched to branch 'main'.
+$ cat a.txt
+A
+$ ls
+a.txt   run.sh
+$ ls -l run.sh
+-rwxr-xr-x  1 …  run.sh
+```
+
+A tracked file with local edits blocks the switch, and nothing is lost:
+
+```
+$ printf 'local\n' > a.txt
+$ minigit checkout feature
+minigit: local changes would be lost: a.txt; commit or undo your edits first
+$ cat a.txt
+local
+$ minigit status
+On branch main
+not staged:
+  a.txt
+```
+
+An untracked file that the target branch would overwrite also blocks it:
+
+```
+$ printf 'A\n' > a.txt
+$ printf 'mine\n' > extra.txt
+$ minigit status
+On branch main
+untracked:
+  extra.txt
+$ minigit checkout feature
+minigit: untracked path would be overwritten: extra.txt; move or delete it first
+$ cat extra.txt
+mine
+```
+
+Once the blocker is gone, the switch restores the bytes, the executable bit, and the index:
+
+```
+$ rm extra.txt
+$ minigit checkout feature
+Switched to branch 'feature'.
+$ cat a.txt
+B
+$ ls -l run.sh
+-rwxr-xr-x  1 …  run.sh
+$ cat extra.txt
+x
+$ minigit status
+On branch feature
+clean
+```
+
+Rewriting `a.txt` with its committed bytes (`A`) counts as no change, because status compares content, not whether a file was touched.
+
+## 3. Conflict resolution
+
+```
+$ printf 'x\n' > file.txt
+$ minigit add file.txt
+$ minigit commit -m base
+[main c66dfab] base
+$ minigit branch feature
+Created branch 'feature' at c66dfab.
+$ printf 'ours\n' > file.txt
+$ minigit add file.txt
+$ minigit commit -m ours
+[main 398a1f9] ours
+$ minigit checkout feature
+Switched to branch 'feature'.
+$ printf 'theirs\n' > file.txt
+$ minigit add file.txt
+$ minigit commit -m theirs
+[feature ee4d829] theirs
+$ minigit checkout main
+Switched to branch 'main'.
+$ minigit merge feature
+minigit: merge conflict in: file.txt
+resolve conflicts, run 'minigit add <path>', then 'minigit commit -m <message>'
+$ cat file.txt
+<<<<<<< HEAD
+ours
+=======
+theirs
+>>>>>>> feature
+$ minigit status
+On branch main
+unresolved (merge conflict):
+  file.txt
+$ minigit commit -m early
+minigit: unresolved merge paths: file.txt
+$ printf 'resolved\n' > file.txt
+$ minigit status
+On branch main
+unresolved (merge conflict):
+  file.txt
+$ minigit add file.txt
+$ minigit status
+On branch main
+staged:
+  file.txt
+$ minigit commit -m "resolved by hand"
+[main 4051f66] resolved by hand
+$ minigit status
+On branch main
+clean
+```
+
+Editing the file does not resolve the conflict. Only `add` does, and the final commit is the two-parent merge commit. Run the branch setup on `main` first and the conflicting edit on `feature` second; if `feature` is simply ahead of `main`, `merge` fast-forwards and there is nothing to resolve.
+
+## What this shows
+
+| Guarantee | Where it is visible |
+| --- | --- |
+| `add` snapshots the bytes at the moment it runs | part 1: the commit saves `two`, not `three` |
+| `status` keeps staged, not staged, and untracked separate | parts 1 and 2 |
+| `status` and `diff` only read | no command in this segment changes a file, the index, or a ref because of them |
+| `checkout` validates before it writes | part 2: both refusals leave every file as it was |
+| A merge conflict stays visible until `add` | part 3 |
+
+Resolving a conflict by deleting the file, mode-only changes, binary files, and unusual paths are covered by the automated tests (`tests/test_index.py`, `tests/test_checkout_safety.py`, and the integration tests), not by this walkthrough.
+
+## Validation record and remaining rehearsal
+
+This segment was run by hand on 2026-11-19 at `2e87586` (`main`), Python 3.13.5, macOS on Apple silicon. Its output matches the blocks above apart from commit hashes and the `ls -l` details. The combined quality check passes all 445 tests.
+
+Another teammate must still follow this segment without setup help at the final shared-checkpoint revision.

@@ -86,8 +86,15 @@ The original storage flow was reported as rehearsed on `006740a` with Python
 quality check passes all 445 tests, including 82 object tests. The final #72
 commit identifies the complete script and documentation revision.
 
-Another teammate must still follow this segment at the final shared-checkpoint
-revision and record their name, revision, environment, and any blockers in
-#60/#67. This local validation does not claim that teammate rehearsal or the
-full project demo is complete. Pruning, garbage collection, delta compression,
-and a pack CLI remain outside this segment.
+The final integrated storage run was repeated on 2026-11-19 at
+`2e875865a312479abecb475a77fddee73fcd5667` on Windows 10 build 26200 with
+Python 3.11.9. The demo printed the exact block above; all 82 object tests
+passed, and the full Ruff lint, formatting, and pytest checks passed with
+433 tests passed and 12 skipped. The storage benchmark for this revision is
+in [the performance report](performance.md#final-week-10-windows-checkpoint).
+
+A teammate must still follow this segment at the final shared-checkpoint
+revision and record their name, revision, environment, and blockers in #60/#67.
+This local validation does not claim that teammate rehearsal or the full
+project demo is complete. Pruning, garbage collection, delta compression, and
+a pack CLI remain outside this segment.
